@@ -7,6 +7,7 @@ The scope_node is the strategic hub that routes based on engagement state.
 """
 
 import os
+import re
 import time
 from typing import Dict, List, Optional
 
@@ -25,6 +26,25 @@ import tools.recon as recon
 import tools.web_enum as web
 import tools.ad_enum as ad
 import tools.vuln_scan as vs
+
+# Import optional modules (may not exist if subagents haven't finished)
+try:
+    import tools.dns_enum as dns
+    _HAS_DNS = True
+except ImportError:
+    _HAS_DNS = False
+
+try:
+    import tools.snmp_enum as snmp
+    _HAS_SNMP = True
+except ImportError:
+    _HAS_SNMP = False
+
+try:
+    import tools.extra_enum as extra
+    _HAS_EXTRA = True
+except ImportError:
+    _HAS_EXTRA = False
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -148,7 +168,7 @@ def enumerate_node(state: ReconState) -> ReconState:
 
 
 def _enumerate_host(state, host, target, new_findings):
-    """Full deep enumeration of a host: ports, services, web, AD."""
+    """Full deep enumeration of a host: ports, services, web, AD, DNS, SNMP."""
     # Full port scan if not done
     if len(host["services"]) < 5:
         print(f"  [>] Full port scan on {target}...")
@@ -160,9 +180,28 @@ def _enumerate_host(state, host, target, new_findings):
             f"[ENUM] {target}: {len(services)} ports, OS: {os_hint}"
         )
 
+    # UDP scan (top 200 ports) — catches SNMP, DNS, TFTP, NFS, NetBIOS
+    print(f"  [>] UDP scan on {target}...")
+    udp_services = recon.udp_scan(target)
+    if udp_services:
+        for port, svc in udp_services.items():
+            if port not in host["services"]:
+                host["services"][port] = svc
+                new_findings.append(
+                    f"[ENUM] {target}: UDP {port}/{svc['service']} discovered"
+                )
+
     # Deep service enumeration
     print(f"  [>] Deep service enumeration on {target}...")
     host["services"] = recon.scan_all_services(target, host["services"])
+
+    # Nmap vuln scripts (safe category)
+    print(f"  [>] Nmap vuln scripts on {target}...")
+    vuln_findings = recon.nmap_vuln_scripts(target)
+    for vf in vuln_findings:
+        new_findings.append(
+            f"[VULN] {target}: {vf['vulnerability']} — {vf['detail'][:80]}"
+        )
 
     # searchsploit on all service versions
     for port, svc in host["services"].items():
@@ -186,11 +225,35 @@ def _enumerate_host(state, host, target, new_findings):
                 if sans:
                     new_findings.append(f"[ENUM] {target}: cert SANs: {', '.join(sans)}")
 
+    # DNS enumeration (if DNS port detected)
+    if 53 in host["services"] or _HAS_DNS:
+        _enumerate_dns(state, host, target, new_findings)
+
+    # SNMP enumeration (if SNMP port detected)
+    if 161 in host["services"] and _HAS_SNMP:
+        _enumerate_snmp(state, host, target, new_findings)
+
+    # NFS enumeration (if NFS detected)
+    if 2049 in host["services"] and _HAS_EXTRA:
+        _enumerate_nfs(state, host, target, new_findings)
+
     # Web enumeration
     for port, svc in host["services"].items():
         svc_name = svc["service"].lower()
         if "http" in svc_name or "ssl" in svc_name or "https" in svc_name:
             _enumerate_web(state, host, target, port, svc, new_findings)
+
+    # Nuclei scan on web services
+    for port, svc in host["services"].items():
+        svc_name = svc["service"].lower()
+        if "http" in svc_name or "ssl" in svc_name or "https" in svc_name:
+            scheme = "https" if ("ssl" in svc_name or "https" in svc_name or port == 443) else "http"
+            use_ssl = scheme == "https"
+            nuclei_results = recon.nuclei_scan(target, port, use_ssl=use_ssl)
+            for nr in nuclei_results:
+                new_findings.append(
+                    f"[VULN] Nuclei: {nr['name']} [{nr['severity']}] at {nr['matched']}"
+                )
 
     # AD enumeration
     ad_ports = {88, 389, 464, 636, 3268, 3269}
@@ -203,6 +266,10 @@ def _enumerate_host(state, host, target, new_findings):
         for s in host["services"].values()
     ):
         _enumerate_smb(state, host, target, new_findings)
+
+    # Database/service checks
+    if _HAS_EXTRA:
+        _enumerate_extra_services(state, host, target, new_findings)
 
 
 def _enumerate_web(state, host, target, port, svc, new_findings):
@@ -293,18 +360,86 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
     )
     host.setdefault("attack_vectors", []).extend(vectors)
 
-    # Also enumerate interesting subdirectories
-    subdir_paths = [
-        d["path"] for d in dirs
-        if d["status"] in (200, 301, 302) and "." not in d["path"].rsplit("/", 1)[-1]
-    ]
-    for subpath in subdir_paths[:5]:
-        subdir_url = f"{url}{subpath}" + ("" if subpath.endswith("/") else "/")
-        sub_tech = web.fingerprint_tech(subdir_url)
-        if sub_tech and sub_tech.get("technologies"):
+    # Advanced web enumeration
+    print(f"  [>] Advanced web enum on {url}...")
+
+    # JS file analysis
+    js_findings = web.analyze_js_files(url)
+    for jf in js_findings:
+        if jf["type"] == "js_secret":
             new_findings.append(
-                f"[ENUM] {subdir_url}: {', '.join(sub_tech['technologies'])}"
+                f"[!] JS SECRET in {jf['file']}: {jf['secret_type']} — {jf.get('preview', '')[:50]}"
             )
+        elif jf["type"] == "js_api_endpoints":
+            new_findings.append(
+                f"[ENUM] {url}: JS API endpoints in {jf['file']}: {', '.join(jf['endpoints'][:5])}"
+            )
+
+    # HTTP methods + CORS
+    http_methods = web.check_http_methods(url)
+    if http_methods.get("methods"):
+        new_findings.append(
+            f"[ENUM] {url}: HTTP methods: {', '.join(http_methods['methods'])}"
+        )
+    if http_methods.get("put_test"):
+        new_findings.append(f"[!] {url}: {http_methods['put_test']}")
+    cors = http_methods.get("cors")
+    if cors and cors.get("reflects"):
+        new_findings.append(
+            f"[!] {url}: CORS reflects origin (creds={cors.get('credentials', False)})"
+        )
+
+    # Parameter discovery
+    params = web.discover_params(url)
+    if params:
+        new_findings.append(f"[ENUM] {url}: Active parameters: {', '.join(params[:10])}")
+
+    # Backup files
+    backup_findings = web.check_backup_files(url, dirs)
+    for bf in backup_findings:
+        btype = bf.get("type", "backup")
+        new_findings.append(
+            f"[{'!' if btype == 'git_exposure' else '*'}] {url}{bf['path']} "
+            f"({bf['status']}, {bf['size']}b) [{btype}]"
+        )
+
+    # Deep link crawling
+    crawled = web.deep_link_crawl(url, max_pages=5)
+    for cl in crawled[:10]:
+        new_findings.append(f"[ENUM] {url}: Crawled: {cl['path']} (from {cl['found_on']})")
+
+    # Generate vectors from advanced web findings
+    extra_vectors = vs.vectors_for_extra_web(
+        url, js_findings, http_methods, backup_findings, params, crawled,
+    )
+    host.setdefault("attack_vectors", []).extend(extra_vectors)
+
+    # Vhost brute-forcing (only on first web port)
+    if port == 80 or port == 443:
+        print(f"  [>] Vhost brute-forcing {target}...")
+        vhosts = web.vhost_bruteforce(target)
+        for vh in vhosts:
+            new_findings.append(f"[ENUM] {target}: Vhost discovered: {vh}")
+
+    # CMS-specific enumeration
+    tech_str = " ".join(tech.get("technologies", [])).lower() if tech else ""
+    if _HAS_EXTRA:
+        if "wordpress" in tech_str or "wp-content" in str(page_data):
+            wp_info = extra.wordpress_enum(url)
+            if wp_info.get("users"):
+                new_findings.append(f"[ENUM] {url}: WordPress users: {', '.join(wp_info['users'])}")
+            if wp_info.get("version"):
+                new_findings.append(f"[ENUM] {url}: WordPress version: {wp_info['version']}")
+            if wp_info.get("plugins"):
+                new_findings.append(f"[ENUM] {url}: WordPress plugins: {', '.join(wp_info['plugins'][:5])}")
+        elif "joomla" in tech_str:
+            joom_info = extra.joomla_enum(url)
+            if joom_info:
+                new_findings.append(f"[ENUM] {url}: Joomla detected: {joom_info}")
+        elif "drupal" in tech_str:
+            drup_info = extra.drupal_enum(url)
+            if drup_info:
+                new_findings.append(f"[ENUM] {url}: Drupal detected: {drup_info}")
 
     return web_app
 
@@ -349,6 +484,12 @@ def _enumerate_ad(state, host, target, new_findings):
         new_findings.append(f"[ENUM] {target}: {len(cas)} ADCS CA(s) found")
         di["ca_servers"] = cas
 
+    # Password policy
+    pw_policy = ad.get_password_policy(dc_ip, domain_name)
+    if pw_policy:
+        di["password_policy"] = pw_policy
+        new_findings.append(f"[ENUM] {target}: Password policy: {pw_policy}")
+
     state["domain_info"] = di
 
     # Generate AD attack vectors
@@ -367,7 +508,6 @@ def _enumerate_ad(state, host, target, new_findings):
 def _enumerate_smb(state, host, target, new_findings):
     """Enumerate SMB shares and info."""
     print(f"  [>] SMB enumeration on {target}...")
-
     shares = ad.enumerate_smb_shares(target)
     if shares:
         new_findings.append(f"[ENUM] {target}: {len(shares)} SMB share(s)")
@@ -381,6 +521,180 @@ def _enumerate_smb(state, host, target, new_findings):
     if signing is not None:
         status = "NOT REQUIRED" if signing else "required"
         new_findings.append(f"[ENUM] {target}: SMB signing {status}")
+
+    # enum4linux
+    print(f"  [>] enum4linux on {target}...")
+    enum4 = ad.run_enum4linux(target)
+    if enum4.get("users"):
+        new_findings.append(f"[ENUM] {target}: enum4linux found {len(enum4['users'])} users")
+        state.setdefault("_domain_users", []).extend(enum4["users"])
+    if enum4.get("password_policy"):
+        new_findings.append(f"[ENUM] {target}: password policy: {enum4['password_policy']}")
+    if enum4.get("os_info"):
+        new_findings.append(f"[ENUM] {target}: OS: {enum4['os_info']}")
+
+    # GPP password check
+    gpp = ad.check_gpp_password(target)
+    for g in gpp:
+        new_findings.append(f"[!] {target}: {g['detail']}")
+
+    # WebDAV check
+    if ad.check_webdav(target):
+        new_findings.append(f"[ENUM] {target}: WebDAV enabled")
+
+
+def _enumerate_dns(state, host, target, new_findings):
+    """DNS enumeration."""
+    if not _HAS_DNS:
+        return
+
+    print(f"  [>] DNS enumeration on {target}...")
+
+    # Zone transfer attempts
+    # Try to infer domain from SSL SANs or known domains
+    domains_to_try = set()
+    di = state.get("domain_info") or {}
+    if di.get("name"):
+        domains_to_try.add(di["name"])
+
+    # Extract domains from cert SANs
+    for port, svc in host["services"].items():
+        banner = svc.get("banner", "")
+        sans = re.findall(r"sans.*?:\s*(.+)", banner)
+        for s in sans:
+            for domain in s.split(","):
+                d = domain.strip()
+                if "." in d and "localhost" not in d:
+                    domains_to_try.add(d)
+
+    for domain in domains_to_try:
+        zt = dns.zone_transfer(target, domain)
+        if zt and zt.get("records"):
+            new_findings.append(
+                f"[!] DNS zone transfer successful on {target} for {domain}! "
+                f"{len(zt['records'])} records"
+            )
+
+    # DNS recursion check
+    if dns.check_dns_recursion(target):
+        new_findings.append(f"[ENUM] {target}: DNS recursion enabled (open resolver)")
+
+    # SRV records (AD)
+    if di.get("name"):
+        srv_records = dns.enum_srv_records(target, di["name"])
+        if srv_records:
+            new_findings.append(f"[ENUM] {target}: {len(srv_records)} SRV records")
+            for sr in srv_records[:5]:
+                new_findings.append(f"  → {sr}")
+
+
+def _enumerate_snmp(state, host, target, new_findings):
+    """SNMP enumeration."""
+    if not _HAS_SNMP:
+        return
+
+    print(f"  [>] SNMP enumeration on {target}...")
+
+    # Try common communities
+    community = snmp.try_communities(target)
+    if not community:
+        return
+
+    new_findings.append(f"[ENUM] {target}: SNMP community '{community}' works")
+
+    # System info
+    sysinfo = snmp.snmp_enum_system(target, community)
+    if sysinfo:
+        new_findings.append(f"[ENUM] {target}: SNMP sysDescr: {sysinfo.get('description', '')[:80]}")
+        new_findings.append(f"[ENUM] {target}: SNMP sysName: {sysinfo.get('hostname', '')}")
+
+    # Processes
+    procs = snmp.snmp_enum_processes(target, community)
+    if procs:
+        new_findings.append(f"[ENUM] {target}: SNMP {len(procs)} processes discovered")
+        # Look for interesting processes
+        for p in procs:
+            if any(kw in p.lower() for kw in ["ssh", "ftp", "http", "nginx", "apache",
+                                                "mysql", "postgres", "redis", "docker"]):
+                new_findings.append(f"  → process: {p[:80]}")
+
+    # Network interfaces (may reveal internal networks)
+    netinfo = snmp.snmp_enum_network(target, community)
+    if netinfo:
+        for iface in netinfo[:5]:
+            ip = iface.get("ip", "")
+            if ip and not ip.startswith("127."):
+                new_findings.append(f"[ENUM] {target}: SNMP interface IP: {ip}")
+                # Add internal networks to accessible_subnets
+                parts = ip.split(".")
+                if len(parts) == 4:
+                    subnet = f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+                    if subnet not in state["accessible_subnets"]:
+                        state["accessible_subnets"].append(subnet)
+                        new_findings.append(f"[ENUM] {target}: New network via SNMP: {subnet}")
+
+
+def _enumerate_nfs(state, host, target, new_findings):
+    """NFS enumeration."""
+    if not _HAS_EXTRA:
+        return
+
+    print(f"  [>] NFS enumeration on {target}...")
+    exports = extra.nfs_enum(target)
+    if exports:
+        new_findings.append(f"[ENUM] {target}: {len(exports)} NFS export(s)")
+        for exp in exports:
+            new_findings.append(
+                f"  → {exp['directory']} (hosts: {exp.get('hosts', '*')})"
+            )
+
+
+def _enumerate_extra_services(state, host, target, new_findings):
+    """Check databases and other services that might be unauthenticated."""
+    for port, svc in host["services"].items():
+        svc_name = svc["service"].lower()
+
+        # MSSQL
+        if "mssql" in svc_name or port == 1433:
+            mssql_info = extra.check_mssql(target, port)
+            if mssql_info:
+                new_findings.append(f"[ENUM] {target}:{port}: MSSQL info: {mssql_info}")
+
+        # MongoDB
+        if "mongodb" in svc_name or port == 27017:
+            mongo_info = extra.check_mongodb(target, port)
+            if mongo_info and mongo_info.get("accessible"):
+                new_findings.append(f"[!] {target}:{port}: MongoDB unauthenticated!")
+
+        # Redis
+        if "redis" in svc_name or port == 6379:
+            redis_info = extra.check_redis(target, port)
+            if redis_info and redis_info.get("accessible"):
+                new_findings.append(f"[!] {target}:{port}: Redis unauthenticated!")
+
+        # Elasticsearch
+        if "elasticsearch" in svc_name or port == 9200:
+            es_info = extra.check_elasticsearch(target, port)
+            if es_info and es_info.get("accessible"):
+                new_findings.append(f"[!] {target}:{port}: Elasticsearch open!")
+
+        # SMTP user enum
+        if "smtp" in svc_name or port in (25, 587):
+            smtp_users = extra.smtp_enum_users(target, port)
+            if smtp_users:
+                new_findings.append(
+                    f"[ENUM] {target}:{port}: SMTP users: {', '.join(smtp_users[:10])}"
+                )
+                state.setdefault("_domain_users", []).extend(smtp_users)
+
+        # FTP anonymous content
+        if "ftp" in svc_name or port == 21:
+            ftp_info = extra.check_ftp_content(target, port)
+            if ftp_info and ftp_info.get("anonymous"):
+                files = ftp_info.get("files", [])
+                new_findings.append(f"[ENUM] {target}:{port}: FTP anonymous access, {len(files)} files")
+                for f in files[:5]:
+                    new_findings.append(f"  → {f}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -399,11 +713,20 @@ def analyze_node(state: ReconState) -> ReconState:
     all_findings = state.get("findings", [])[-200:]
     findings_text = "\n".join(all_findings[-100:])
 
-    # Collect all attack vectors
+    # Collect all attack vectors — DEDUP by ID
     all_vectors = []
+    seen_ids = set()
     for ip, host in state["hosts"].items():
-        all_vectors.extend(host.get("attack_vectors", []))
-    all_vectors.extend(state.get("attack_vectors", []))
+        for v in host.get("attack_vectors", []):
+            vid = v.get("id", "")
+            if vid not in seen_ids:
+                all_vectors.append(v)
+                seen_ids.add(vid)
+    for v in state.get("attack_vectors", []):
+        vid = v.get("id", "")
+        if vid not in seen_ids:
+            all_vectors.append(v)
+            seen_ids.add(vid)
 
     vectors_text = "\n".join(
         f"- [{v['confidence']}/{v['score']}] {v['title']} "
@@ -496,8 +819,15 @@ Return JSON with this structure:
     else:
         print("  [!] LLM analysis failed, using heuristic ranking only")
 
-    # Merge all vectors into state
-    state["attack_vectors"] = all_vectors + state.get("attack_vectors", [])[-10:]
+    # Merge all vectors into state — DEDUP by vector ID to prevent double counting
+    seen_ids = {v.get("id", "") for v in state.get("attack_vectors", [])}
+    merged = list(state.get("attack_vectors", []))
+    for v in all_vectors:
+        vid = v.get("id", "")
+        if vid not in seen_ids:
+            merged.append(v)
+            seen_ids.add(vid)
+    state["attack_vectors"] = merged[-500:]
 
     return {**state, "current_phase": "scope", "iteration": state["iteration"] + 1}
 
@@ -647,11 +977,20 @@ def report_node(state: ReconState) -> ReconState:
 
     summary = get_engagement_summary(state)
 
-    # Collect all attack vectors
+    # Collect all attack vectors — DEDUP by ID to prevent double counting
     all_vectors = []
+    seen_ids = set()
     for ip, host in state["hosts"].items():
-        all_vectors.extend(host.get("attack_vectors", []))
-    all_vectors.extend(state.get("attack_vectors", []))
+        for v in host.get("attack_vectors", []):
+            vid = v.get("id", "")
+            if vid not in seen_ids:
+                all_vectors.append(v)
+                seen_ids.add(vid)
+    for v in state.get("attack_vectors", []):
+        vid = v.get("id", "")
+        if vid not in seen_ids:
+            all_vectors.append(v)
+            seen_ids.add(vid)
 
     # Sort by score
     all_vectors = sorted(all_vectors, key=lambda v: v.get("score", 0), reverse=True)

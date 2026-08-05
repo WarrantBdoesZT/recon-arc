@@ -399,3 +399,282 @@ def vhost_bruteforce(
                 print(f"    [+] Vhost: {domain} ({size}b)")
 
     return discovered
+
+
+# ── Advanced Web Enumeration ───────────────────────────────────────────
+
+def recursive_directory_bust(
+    url: str,
+    wordlist: str = "/usr/share/wordlists/dirb/common.txt",
+    max_depth: int = 2,
+    found_dirs: List[dict] = None,
+    _depth: int = 0,
+) -> List[dict]:
+    """Recursively bust directories — finds /admin/config/ not just /admin/."""
+    if _depth >= max_depth:
+        return found_dirs or []
+
+    if found_dirs is None:
+        found_dirs = []
+
+    dirs = directory_bust(url, wordlist=wordlist)
+
+    for d in dirs:
+        found_dirs.append(d)
+        # Recurse into directories (not files)
+        path = d["path"]
+        if d["status"] in (200, 301, 302, 401, 403) and "." not in path.rsplit("/", 1)[-1]:
+            subdir_url = f"{url}{path}" + ("" if path.endswith("/") else "/")
+            if subdir_url not in str(found_dirs):  # avoid infinite loops
+                recursive_directory_bust(
+                    subdir_url, wordlist, max_depth, found_dirs, _depth + 1,
+                )
+
+    return found_dirs
+
+
+def analyze_js_files(url: str, js_urls: List[str] = None) -> List[dict]:
+    """Download and analyze JS files for API endpoints, secrets, and interesting patterns."""
+    findings = []
+
+    # If no JS URLs provided, extract from page
+    if not js_urls:
+        page_data = extract_data_from_page(url)
+        js_urls = page_data.get("js_files", [])
+
+    for js_url in js_urls[:15]:
+        full_url = urljoin(url, js_url)
+        resp = http_get(full_url, timeout=10)
+        if not resp or len(resp.text) < 10:
+            continue
+
+        content = resp.text
+
+        # API endpoints
+        api_endpoints = set()
+        for m in re.finditer(r'["\']/(api/[^"\'>\s]+)["\']', content):
+            api_endpoints.add(m.group(1))
+        for m in re.finditer(r'["\']/(v[12]/[^"\'>\s]+)["\']', content):
+            api_endpoints.add(m.group(1))
+
+        # AJAX URLs
+        for m in re.finditer(r'(?:fetch|ajax|axios|\.get|\.post)\s*\(\s*["\']([^"\']+)["\']', content, re.IGNORECASE):
+            path = m.group(1)
+            if path.startswith("/") or path.startswith("http"):
+                api_endpoints.add(path)
+
+        if api_endpoints:
+            findings.append({
+                "type": "js_api_endpoints",
+                "file": js_url,
+                "endpoints": list(api_endpoints)[:20],
+            })
+
+        # Secrets/tokens
+        secret_patterns = [
+            (r'(?:api[_-]?key|apikey)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-]{20,})["\']', "API Key"),
+            (r'(?:secret|token|auth)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-]{20,})["\']', "Secret/Token"),
+            (r'(?:password|passwd|pwd)["\']?\s*[:=]\s*["\']([^"\']{6,})["\']', "Password"),
+            (r'(?:aws_access|aws_secret|stripe|github_token|ghp_)', "Cloud/Service Key"),
+            (r'Bearer\s+([A-Za-z0-9_\-\.]{20,})', "JWT/Bearer Token"),
+            (r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}', "JWT Token"),
+        ]
+        for pattern, secret_type in secret_patterns:
+            matches = re.findall(pattern, content, re.IGNORECASE)
+            if matches:
+                findings.append({
+                    "type": "js_secret",
+                    "file": js_url,
+                    "secret_type": secret_type,
+                    "preview": str(matches[0])[:50],
+                })
+
+        # Source maps (can leak original source)
+        if "sourceMappingURL" in content:
+            findings.append({
+                "type": "js_sourcemap",
+                "file": js_url,
+                "note": "Source map reference found — may leak original source code",
+            })
+
+    return findings
+
+
+def check_http_methods(url: str) -> dict:
+    """Check allowed HTTP methods and override headers."""
+    result = {"methods": [], "put_test": None, "cors": None, "headers": {}}
+
+    # OPTIONS method
+    resp = http_get(url, timeout=5, allow_redirects=False)
+    if resp:
+        allow = resp.headers.get("Allow", "")
+        if allow:
+            result["methods"] = [m.strip() for m in allow.split(",")]
+
+        # X-Powered-By, X-Forwarded-For trust, etc.
+        for h in ["X-Powered-By", "X-AspNet-Version", "X-Generator",
+                   "X-Runtime", "X-Version", "Via", "X-Cache"]:
+            val = resp.headers.get(h)
+            if val:
+                result["headers"][h] = val
+
+    # Test CORS
+    cors_resp = http_get(
+        url, timeout=5, allow_redirects=False,
+        headers={"Origin": "https://evil.com"},
+    )
+    if cors_resp:
+        acao = cors_resp.headers.get("Access-Control-Allow-Origin", "")
+        acac = cors_resp.headers.get("Access-Control-Allow-Credentials", "")
+        if acao:
+            result["cors"] = {
+                "origin": acao,
+                "credentials": acac.lower() == "true",
+                "reflects": acao == "https://evil.com",
+            }
+
+    # Test TRACE
+    try:
+        import requests as req
+        trace_resp = req.request("TRACE", url, timeout=5, verify=False)
+        if trace_resp.status_code == 200 and "TRACE" in trace_resp.text:
+            result["methods"].append("TRACE (active)")
+    except Exception:
+        pass
+
+    # Test PUT
+    try:
+        import requests as req
+        put_resp = req.request("PUT", url + "/test_reconarc.txt",
+                               data="test", timeout=5, verify=False)
+        if put_resp.status_code in (200, 201, 204):
+            result["put_test"] = "PUT allowed — potential webshell upload"
+    except Exception:
+        pass
+
+    return result
+
+
+def discover_params(url: str, wordlist: str = None) -> List[str]:
+    """Discover URL parameters that elicit different responses."""
+    common_params = [
+        "id", "page", "file", "cmd", "exec", "query", "search", "q",
+        "url", "redirect", "next", "target", "path", "template",
+        "debug", "test", "admin", "user", "name", "email", "cat",
+        "category", "item", "doc", "document", "lang", "load",
+        "process", "step", "action", "module", "include", "require",
+        "source", "dest", "destination", "callback", "return",
+        "image", "img", "download", "view", "profile", "report",
+        "token", "key", "auth", "session", "hash", "ref", "refid",
+        "order", "sort", "filter", "type", "format", "output",
+        "blog_id", "post", "p", "sub", "section", "topic", "forum",
+    ]
+
+    found = []
+    baseline = http_get(url, timeout=5)
+    baseline_size = len(baseline.text) if baseline else 0
+    baseline_code = baseline.status_code if baseline else 0
+
+    for param in common_params:
+        test_url = f"{url}?{param}=testvalue123"
+        resp = http_get(test_url, timeout=5)
+        if not resp:
+            continue
+        # Different response = parameter has effect
+        if resp.status_code != baseline_code or abs(len(resp.text) - baseline_size) > 100:
+            found.append(param)
+
+    return found
+
+
+def check_backup_files(url: str, discovered_dirs: List[dict] = None) -> List[dict]:
+    """Check for backup files of discovered paths and common source files."""
+    findings = []
+
+    # Common backup extensions
+    backup_exts = [".bak", ".old", ".orig", ".save", ".swp", ".~",
+                   ".copy", ".backup", ".tmp", ".dist", ".1", ".2"]
+
+    # Files to check for backups
+    base_files = [
+        "index.php", "index.html", "config.php", "wp-config.php",
+        "database.yml", "settings.py", ".env", "web.config",
+        "application.properties", "appsettings.json",
+    ]
+
+    # Also check backups of discovered directories
+    if discovered_dirs:
+        for d in discovered_dirs[:20]:
+            if "." not in d["path"].rsplit("/", 1)[-1]:
+                base_files.append(d["path"].rstrip("/") + "/index.php")
+
+    for base_file in base_files:
+        for ext in backup_exts:
+            test_url = urljoin(url, f"/{base_file}{ext}")
+            resp = http_get(test_url, timeout=3, allow_redirects=False)
+            if resp and resp.status_code == 200 and len(resp.text) > 10:
+                findings.append({
+                    "path": f"/{base_file}{ext}",
+                    "status": resp.status_code,
+                    "size": len(resp.text),
+                    "preview": resp.text[:100],
+                })
+
+    # Check .git exposure more deeply
+    git_files = ["/.git/HEAD", "/.git/config", "/.git/index",
+                 "/.git/logs/HEAD", "/.git/refs/heads/master",
+                 "/.git/refs/heads/main"]
+    for gf in git_files:
+        test_url = urljoin(url, gf)
+        resp = http_get(test_url, timeout=3, allow_redirects=False)
+        if resp and resp.status_code == 200 and len(resp.text) > 5:
+            preview = resp.text[:200]
+            # Verify it's actually git data
+            if "ref:" in preview or "[core]" in preview or "commit" in preview:
+                findings.append({
+                    "path": gf,
+                    "status": 200,
+                    "size": len(resp.text),
+                    "preview": preview[:100],
+                    "type": "git_exposure",
+                })
+
+    return findings
+
+
+def deep_link_crawl(url: str, max_pages: int = 10) -> List[dict]:
+    """Crawl linked pages from the homepage to discover more content."""
+    from collections import deque
+
+    visited = set()
+    queue = deque([(url, 0)])
+    discovered = []
+    max_depth = 2
+
+    while queue and len(visited) < max_pages:
+        current_url, depth = queue.popleft()
+        if current_url in visited or depth > max_depth:
+            continue
+        visited.add(current_url)
+
+        resp = http_get(current_url, timeout=5)
+        if not resp or resp.status_code != 200:
+            continue
+
+        # Extract links
+        links = re.findall(r'href=["\']([^"\']+)["\']', resp.text, re.IGNORECASE)
+        for link in links:
+            full_url = urljoin(current_url, link)
+            # Same-origin only
+            if urlparse(full_url).netloc == urlparse(url).netloc or full_url.startswith("/"):
+                clean_url = urljoin(url, full_url)
+                path = urlparse(clean_url).path
+                if path not in [d["path"] for d in discovered] and path != "/":
+                    discovered.append({
+                        "path": path,
+                        "found_on": urlparse(current_url).path,
+                        "status": resp.status_code,
+                    })
+                    queue.append((clean_url, depth + 1))
+
+    return discovered

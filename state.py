@@ -255,12 +255,24 @@ def get_engagement_summary(state: ReconState) -> str:
         if av_count:
             lines.append(f"                   Attack vectors: {av_count}")
 
-    # Attack vector summary
-    vectors = state.get("attack_vectors", [])
-    if vectors:
-        lines.append(f"\nAttack Vectors: {len(vectors)} total")
+    # Attack vector summary — dedup by ID
+    all_vec_ids = set()
+    all_vecs = []
+    for v in state.get("attack_vectors", []):
+        vid = v.get("id", "")
+        if vid not in all_vec_ids:
+            all_vec_ids.add(vid)
+            all_vecs.append(v)
+    for ip, h in state.get("hosts", {}).items():
+        for v in h.get("attack_vectors", []):
+            vid = v.get("id", "")
+            if vid not in all_vec_ids:
+                all_vec_ids.add(vid)
+                all_vecs.append(v)
+    if all_vecs:
+        lines.append(f"\nAttack Vectors: {len(all_vecs)} total")
         by_cat = {}
-        for v in vectors:
+        for v in all_vecs:
             by_cat.setdefault(v["category"], []).append(v)
         for cat, vecs in sorted(by_cat.items()):
             high = sum(1 for v in vecs if v["confidence"] == "high")

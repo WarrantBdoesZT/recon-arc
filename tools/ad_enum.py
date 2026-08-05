@@ -271,3 +271,172 @@ def check_smb_signing(target_ip: str) -> Optional[bool]:
     if "signing" in result.get("stdout", "").lower():
         return "not required" in result["stdout"].lower()
     return None
+
+
+def run_enum4linux(target_ip: str) -> dict:
+    """Run enum4linux for comprehensive Windows/Samba enumeration."""
+    result = {"output": "", "users": [], "shares": [], "groups": [],
+              "password_policy": {}, "os_info": {}}
+
+    cmd = f"enum4linux -a {target_ip} 2>/dev/null"
+    out = run_command(cmd, timeout=60)
+    text = out.get("stdout", "")
+    result["output"] = text[:2000]  # Keep summary
+
+    if not text:
+        # Try enum4linux-ng
+        cmd = f"enum4linux-ng -A {target_ip} 2>/dev/null"
+        out = run_command(cmd, timeout=60)
+        text = out.get("stdout", "")
+        result["output"] = text[:2000]
+
+    if not text:
+        return result
+
+    # Parse users (user:[username] rpc_client.h)
+    for m in re.finditer(r"user:\[(\S+)\]", text):
+        result["users"].append(m.group(1))
+
+    # Parse share enumeration
+    for m in re.finditer(r"\t(\\S+)\s+(Disk|IPC|Printer)", text):
+        result["shares"].append({"name": m.group(1), "type": m.group(2)})
+
+    # Parse password policy
+    pw_section = re.search(
+        r"Password Policy.*?(?=\n\n|\Z)", text, re.DOTALL,
+    )
+    if pw_section:
+        pw_text = pw_section.group(0)
+        for m in re.finditer(r"(\w[\w\s]+):\s*(\d+)", pw_text):
+            result["password_policy"][m.group(1).strip()] = int(m.group(2))
+
+    # Parse OS info
+    os_match = re.search(r"OS:\s*(.+)", text)
+    if os_match:
+        result["os_info"]["os"] = os_match.group(1).strip()
+    os_version = re.search(r"os_version:\s*(.+)", text, re.IGNORECASE)
+    if os_version:
+        result["os_info"]["version"] = os_version.group(1).strip()
+
+    return result
+
+
+def get_password_policy(dc_ip: str, domain: str = "") -> Optional[dict]:
+    """Get AD password policy via LDAP or rpcclient."""
+    policy = {}
+
+    # Method 1: rpcclient
+    cmd = f"rpcclient -U '' -N {dc_ip} -c 'getdompwinfo' 2>/dev/null"
+    result = run_command(cmd, timeout=15)
+    if result["stdout"]:
+        for line in result["stdout"].split("\n"):
+            if "min_password_length" in line:
+                m = re.search(r"(\d+)", line)
+                if m:
+                    policy["min_length"] = int(m.group(1))
+            elif "password_history_length" in line:
+                m = re.search(r"(\d+)", line)
+                if m:
+                    policy["history"] = int(m.group(1))
+            elif "maximum_password_age" in line:
+                m = re.search(r"(\d+)", line)
+                if m:
+                    policy["max_age"] = int(m.group(1))
+            elif "password_properties" in line:
+                policy["complexity"] = "0x00" not in line
+
+    # Method 2: LDAP — search for domainDNS policy attributes
+    if domain and not policy:
+        base_dn = ",".join(f"DC={p}" for p in domain.split(".")[::-1])
+        cmd = (
+            f"ldapsearch -x -H ldap://{dc_ip} -b '{base_dn}' "
+            f"'(objectClass=domainDNS)' "
+            f"minPwdLength minPwdAge maxPwdAge pwdHistoryLength pwdProperties 2>/dev/null"
+        )
+        result = run_command(cmd, timeout=15)
+        if result["stdout"]:
+            for line in result["stdout"].split("\n"):
+                if "minPwdLength:" in line:
+                    m = re.search(r"(\d+)", line)
+                    if m:
+                        policy["min_length"] = int(m.group(1))
+                elif "pwdHistoryLength:" in line:
+                    m = re.search(r"(\d+)", line)
+                    if m:
+                        policy["history"] = int(m.group(1))
+                elif "pwdProperties:" in line:
+                    m = re.search(r"(\d+)", line)
+                    if m:
+                        policy["complexity"] = int(m.group(1)) > 0
+
+    return policy if policy else None
+
+
+def check_gpp_password(target_ip: str, domain: str = "") -> List[dict]:
+    """Check for Group Policy Preferences (GPP) passwords in SMB shares (cpassword)."""
+    findings = []
+
+    # GPP XML files are typically in SYSVOL
+    # \\\\domain\\SYSVOL\\domain\\Policies\\*\\Machine\\Preferences\\Groups\\Groups.xml
+    # This is read-only enumeration — we only check if the files exist
+
+    cmd = (
+        f"smbclient '//{target_ip}/SYSVOL' -N -c "
+        f"'ls; recurse on; ls' 2>/dev/null | grep -i 'groups.xml\\|services.xml'"
+    )
+    result = run_command(cmd, timeout=20)
+    if result["stdout"] and ("Groups.xml" in result["stdout"] or "Services.xml" in result["stdout"]):
+        findings.append({
+            "type": "gpp_password",
+            "detail": "GPP XML files found in SYSVOL — may contain cpassword (AES-encrypted)",
+            "severity": "high",
+        })
+
+    return findings
+
+
+def enumerate_smb_share_content(target_ip: str, share_name: str = "IPC$") -> List[str]:
+    """List files in accessible SMB shares (read-only)."""
+    files = []
+
+    cmd = f"smbclient '//{target_ip}/{share_name}' -N -c 'ls' 2>/dev/null"
+    result = run_command(cmd, timeout=15)
+    if result["stdout"]:
+        for line in result["stdout"].split("\n"):
+            m = re.match(r"\s+(\S+)\s+\w+\s+\d+\s+(.+)", line)
+            if m:
+                files.append(m.group(1))
+
+    return files
+
+
+def check_webdav(target_ip: str) -> bool:
+    """Check if WebDAV is enabled on the target."""
+    from utils import http_get
+
+    for port in [80, 443, 8080, 8443]:
+        scheme = "https" if port in [443, 8443] else "http"
+        url = f"{scheme}://{target_ip}:{port}/"
+        resp = http_get(url, timeout=3, allow_redirects=False,
+                        headers={"Depth": "0", "Content-Type": "text/xml"})
+        if resp and "DAV:" in resp.text or (resp and resp.headers.get("DAV")):
+            return True
+
+    return False
+
+
+def bloodhound_collector(dc_ip: str, domain: str = "", username: str = "", password: str = "") -> bool:
+    """Check if BloodHound data can be collected (only if creds available)."""
+    # This is enumeration, not exploitation — bloodhound-python just collects LDAP data
+    if not domain:
+        return False
+
+    if username and password:
+        cmd = (
+            f"bloodhound-python -u '{username}' -p '{password}' "
+            f"-d '{domain}' -dc '{dc_ip}' -c All 2>/dev/null"
+        )
+        result = run_command(cmd, timeout=120)
+        return result.get("returncode") == 0
+
+    return False

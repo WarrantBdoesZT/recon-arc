@@ -64,6 +64,21 @@ def port_scan(
     return services, os_hint, result["stdout"]
 
 
+def udp_scan(target_ip: str) -> Dict[int, dict]:
+    """Scan top UDP ports to catch SNMP, DNS, TFTP, NFS, NetBIOS, etc."""
+    print(f"  [>] UDP top-ports scan on {target_ip}...")
+    cmd = (
+        f"nmap -sU --top-ports 200 --open --min-rate 3000 "
+        f"{target_ip} -oN - 2>/dev/null"
+    )
+    result = run_command(cmd, timeout=180)
+    services = parse_nmap_output(result["stdout"])
+    if services:
+        svc_list = ", ".join(f"{s['service']}/{p}/udp" for p, s in sorted(services.items()))
+        print(f"  [+] UDP: {svc_list}")
+    return services
+
+
 def scan_all_services(
     target_ip: str,
     services: Dict[int, dict],
@@ -137,7 +152,7 @@ def scan_all_services(
 
         elif "mssql" in svc_name or port == 1433:
             result = run_command(
-                f"nmap -p {port} --script ms-sql-info "
+                f"nmap -p {port} --script ms-sql-info,ms-sql-empty-password "
                 f"{target_ip} -oN - 2>/dev/null",
                 timeout=15,
             )
@@ -162,12 +177,129 @@ def scan_all_services(
             svc["banner"] = result.get("stdout", "")[:500]
             svc["enumerated"] = True
 
+        elif "snmp" in svc_name or port == 161:
+            result = run_command(
+                f"nmap -p {port} -sU --script snmp-info,snmp-sysdescr "
+                f"{target_ip} -oN - 2>/dev/null",
+                timeout=15,
+            )
+            svc["banner"] = result.get("stdout", "")[:500]
+            svc["enumerated"] = True
+
+        elif "dns" in svc_name or port == 53:
+            result = run_command(
+                f"nmap -p {port} -sU --script dns-recursion,dns-zone-transfer "
+                f"{target_ip} -oN - 2>/dev/null",
+                timeout=15,
+            )
+            svc["banner"] = result.get("stdout", "")[:500]
+            svc["enumerated"] = True
+
+        elif "ntp" in svc_name or port == 123:
+            result = run_command(
+                f"nmap -p {port} -sU --script ntp-info "
+                f"{target_ip} -oN - 2>/dev/null",
+                timeout=15,
+            )
+            svc["banner"] = result.get("stdout", "")[:500]
+            svc["enumerated"] = True
+
+        elif "nfs" in svc_name or port == 2049:
+            svc["enumerated"] = True
+
+        elif "telnet" in svc_name or port == 23:
+            result = run_command(
+                f"nmap -p {port} -sV --script banner "
+                f"{target_ip} -oN - 2>/dev/null",
+                timeout=15,
+            )
+            svc["banner"] = result.get("stdout", "")[:500]
+            svc["enumerated"] = True
+
+        elif "pop3" in svc_name or port in (110, 995):
+            result = run_command(
+                f"nmap -p {port} -sV --script pop3-capabilities "
+                f"{target_ip} -oN - 2>/dev/null",
+                timeout=15,
+            )
+            svc["banner"] = result.get("stdout", "")[:500]
+            svc["enumerated"] = True
+
+        elif "imap" in svc_name or port in (143, 993):
+            result = run_command(
+                f"nmap -p {port} -sV --script imap-capabilities "
+                f"{target_ip} -oN - 2>/dev/null",
+                timeout=15,
+            )
+            svc["banner"] = result.get("stdout", "")[:500]
+            svc["enumerated"] = True
+
+        elif "sip" in svc_name or port == 5060:
+            result = run_command(
+                f"nmap -p {port} -sU --script sip-enum-users "
+                f"{target_ip} -oN - 2>/dev/null",
+                timeout=15,
+            )
+            svc["banner"] = result.get("stdout", "")[:500]
+            svc["enumerated"] = True
+
         else:
             svc["enumerated"] = True
 
         updated[port] = svc
 
     return updated
+
+
+def nmap_vuln_scripts(target_ip: str) -> List[dict]:
+    """Run safe nmap vuln-category scripts for known vulnerability detection."""
+    cmd = (
+        f"nmap --script 'vuln and safe' "
+        f"{target_ip} -oN - 2>/dev/null"
+    )
+    result = run_command(cmd, timeout=120)
+    findings = []
+
+    if result["stdout"]:
+        for m in re.finditer(r"\|\s+([A-Z][^:]+):\s*(.+)", result["stdout"]):
+            vuln_name = m.group(1).strip()
+            vuln_detail = m.group(2).strip()
+            if vuln_name not in ("State", "IDs", "References", "CVSS"):
+                findings.append({
+                    "vulnerability": vuln_name,
+                    "detail": vuln_detail,
+                    "type": "vuln_script_finding",
+                })
+
+    return findings
+
+
+def nuclei_scan(target_ip: str, port: int = None, use_ssl: bool = False) -> List[dict]:
+    """Run nuclei templates for known vulnerabilities (read-only templates)."""
+    scheme = "https" if use_ssl else "http"
+    port_str = f":{port}" if port else ""
+    target_url = f"{scheme}://{target_ip}{port_str}"
+
+    cmd = f"nuclei -u '{target_url}' -severity medium,high,critical -silent -json 2>/dev/null"
+    result = run_command(cmd, timeout=120)
+
+    findings = []
+    if result["stdout"]:
+        import json
+        for line in result["stdout"].strip().split("\n"):
+            try:
+                data = json.loads(line)
+                findings.append({
+                    "template": data.get("template-id", ""),
+                    "name": data.get("info", {}).get("name", ""),
+                    "severity": data.get("info", {}).get("severity", ""),
+                    "matched": data.get("matched-at", ""),
+                    "type": "nuclei",
+                })
+            except json.JSONDecodeError:
+                continue
+
+    return findings
 
 
 def searchsploit(query: str) -> List[dict]:
