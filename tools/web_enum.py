@@ -356,9 +356,17 @@ def extract_data_from_page(url: str) -> dict:
 def vhost_bruteforce(
     ip: str,
     wordlist: str = "/usr/share/wordlists/dirb/common.txt",
+    max_time: int = 30,
 ) -> List[str]:
-    """Discover virtual hosts via Host header manipulation."""
-    # Build a small domain wordlist
+    """Discover virtual hosts via Host header manipulation.
+    
+    Uses a thread pool and a HARD total timeout to prevent hanging on
+    slow/unresponsive hosts.  Max 30 seconds regardless of wordlist size.
+    """
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # Build candidate domain list
     domains = set()
     base_domains = ["htb", "local", "internal", "corp", "lab", "test"]
 
@@ -383,20 +391,48 @@ def vhost_bruteforce(
         for suffix in base_domains:
             domains.add(f"{prefix}.{suffix}")
 
-    discovered = []
+    # Also try SSL-cert-derived names if available (set by caller)
+    candidates = sorted(domains)[:200]
+
+    # Get baseline
+    start_time = time.time()
     baseline = http_get(f"http://{ip}", timeout=5, allow_redirects=False)
     baseline_size = len(baseline.text) if baseline else 0
+    baseline_status = baseline.status_code if baseline else 0
 
-    for domain in sorted(domains)[:200]:  # Limit to 200
+    discovered = []
+
+    def _check_vhost(domain):
+        """Check a single vhost. Returns (domain, status, size) or None."""
+        elapsed = time.time() - start_time
+        if elapsed > max_time:
+            return None
         resp = http_get(
-            f"http://{ip}", timeout=5, allow_redirects=False,
+            f"http://{ip}", timeout=3, allow_redirects=False,
             headers={"Host": domain},
         )
         if resp and resp.status_code == 200:
             size = len(resp.text)
             if abs(size - baseline_size) > 100:
-                discovered.append(domain)
-                print(f"    [+] Vhost: {domain} ({size}b)")
+                return (domain, size)
+        return None
+
+    # Parallel with hard timeout
+    try:
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = {pool.submit(_check_vhost, d): d for d in candidates}
+            for future in as_completed(futures, timeout=max_time):
+                try:
+                    result = future.result(timeout=3)
+                    if result:
+                        domain, size = result
+                        discovered.append(domain)
+                        print(f"    [+] Vhost: {domain} ({size}b)")
+                except Exception:
+                    pass
+    except Exception:
+        # Timeout — we have what we have
+        pass
 
     return discovered
 

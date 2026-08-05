@@ -1153,3 +1153,42 @@ def generate_privesc_vectors(
         ))
 
     return vectors
+
+
+def vectors_for_services(target: str, services: List[dict]) -> List[AttackVector]:
+    """Generate attack vectors for all services on a host (plural wrapper)."""
+    all_vectors = []
+    for svc in services:
+        port = svc.get("port", 0)
+        service_name = svc.get("service", "")
+        version = svc.get("version", "")
+        if service_name:
+            vecs = vectors_for_service(target, port, service_name, version)
+            all_vectors.extend(vecs)
+    return all_vectors
+
+
+def vectors_for_cve(target: str, port: int, service: str, version: str, cve: dict) -> List[AttackVector]:
+    """Generate an attack vector from a discovered CVE."""
+    cve_id = cve.get("id", "CVE-unknown")
+    cvss = cve.get("cvss_score", 0)
+    severity = cve.get("severity", "UNKNOWN")
+    desc = cve.get("description", "")[:120]
+
+    confidence = "high" if cvss >= 7.0 else "medium" if cvss >= 4.0 else "low"
+    score = min(95, int(cvss * 10))
+
+    return [generate_attack_vector(
+        category="initial_access", vector_type="known_cve",
+        target=f"{target}:{port}",
+        title=f"{cve_id} — {service} {version} ({severity})",
+        description=f"{desc}",
+        confidence=confidence, score=score,
+        evidence=[f"{service} {version} matches {cve_id} (CVSS {cvss})"],
+        exploit_suggestions=[
+            f"searchsploit {cve_id}",
+            f"nmap --script vuln -p {port} {target}",
+            f"msfconsole -q -x 'search {cve_id}; use ...'",
+        ],
+        cves=[cve_id],
+    )]

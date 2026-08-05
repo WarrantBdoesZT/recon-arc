@@ -58,6 +58,18 @@ try:
 except ImportError:
     _HAS_CRED_TEST = False
 
+try:
+    import tools.sqli_probe as sqli_probe
+    _HAS_SQLI_PROBE = True
+except ImportError:
+    _HAS_SQLI_PROBE = False
+
+try:
+    import tools.ssl_enum as ssl_enum
+    _HAS_SSL_ENUM = True
+except ImportError:
+    _HAS_SSL_ENUM = False
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # DISCOVER NODE — Find new hosts and services
@@ -184,23 +196,100 @@ def _enumerate_host(state, host, target, new_findings):
     quick_mode = state.get("quick_mode", False)
 
     if quick_mode:
-        # Quick mode: skip everything except basic web title grab
-        print(f"  [QUICK] Skipping deep enumeration (quick mode)")
+        """Quick mode: nmap -sV top-1000 + web fingerprint + forms + SQLi probe + SSL cert.
+        Still generates attack vectors — just skips UDP/deep web/vhost/AD/SNMP."""
+        import requests as _requests
+
+        # Fast nmap version scan (top-1000 ports with -sV)
+        if len(host["services"]) < 3:
+            print(f"  [QUICK] Fast service scan on {target}...")
+            services, os_hint, _ = recon.quick_scan(target)
+            host["services"] = services
+            if os_hint != "unknown":
+                host["os"] = os_hint
+
+        # For each web service, do targeted enumeration
         for port, svc in host["services"].items():
             svc_name = svc.get("service", "").lower()
-            if "http" in svc_name or "ssl" in svc_name:
-                scheme = "https" if "ssl" in svc_name or port in (443, 8443) else "http"
-                url = f"{scheme}://{target}:{port}"
-                new_findings.append(f"[QUICK-ENUM] {url}: web service detected")
-                # Quick title grab
-                import requests
+            if "http" not in svc_name and "ssl" not in svc_name:
+                continue
+
+            scheme = "https" if ("ssl" in svc_name or port in (443, 8443)) else "http"
+            url = f"{scheme}://{target}:{port}"
+
+            # Title + fingerprint
+            try:
+                r = _requests.get(url, timeout=5, verify=False, allow_redirects=True)
+                title_match = re.search(r"<title>(.*?)</title>", r.text, re.I)
+                title = title_match.group(1).strip() if title_match else ""
+                new_findings.append(
+                    f"[QUICK-ENUM] {url}: title='{title}', status={r.status_code}, "
+                    f"server={r.headers.get('Server', '?')}"
+                )
+
+                # Extract forms from page
+                forms = web.discover_forms(url)
+                if forms:
+                    new_findings.append(f"[QUICK-ENUM] {url}: {len(forms)} form(s)")
+                    for f in forms[:3]:
+                        fields = ", ".join(f.get("fields", [])) if isinstance(f.get("fields"), list) else str(f.get("fields", []))
+                        new_findings.append(f"  → {f['method']} {f['action']} fields=[{fields}]")
+
+                # Active SQLi probe on forms
+                for form in forms[:3]:
+                    try:
+                        results = sqli_probe.probe_form(url, form)
+                        for vuln in results:
+                            if vuln.get("is_vulnerable"):
+                                new_findings.append(
+                                    f"[!] SQLI CONFIRMED: {url} param '{vuln['parameter']}' "
+                                    f"via {vuln['injection_type']} — {vuln.get('evidence', [''])[0][:60]}"
+                                )
+                                # Generate attack vector
+                                vectors = sqli_probe.generate_sqli_vector(
+                                    url, vuln["parameter"], vuln
+                                )
+                                host.setdefault("attack_vectors", []).extend(vectors)
+                    except Exception:
+                        pass
+
+            except Exception:
+                pass
+
+            # SSL cert analysis for HTTPS
+            if scheme == "https":
                 try:
-                    r = requests.get(url, timeout=5, verify=False, allow_redirects=True)
-                    title_match = re.search(r"<title>(.*?)</title>", r.text, re.I)
-                    title = title_match.group(1) if title_match else r.text[:50]
-                    new_findings.append(f"[QUICK-ENUM] {url}: title='{title}', status={r.status_code}")
+                    cert_info = ssl_enum.extract_cert(target, port)
+                    if cert_info and cert_info.get("subject_cn"):
+                        new_findings.append(
+                            f"[CERT] {url}: CN={cert_info['subject_cn']}, "
+                            f"ORG={cert_info.get('subject_org', '?')}, "
+                            f"OU={cert_info.get('subject_ou', '?')}, "
+                            f"ISSUER={cert_info.get('issuer_cn', '?')}"
+                        )
+                        if cert_info.get("san_list"):
+                            new_findings.append(
+                                f"[CERT] {url}: SANs={', '.join(cert_info['san_list'][:5])}"
+                            )
+                        if cert_info.get("is_self_signed"):
+                            new_findings.append(f"[CERT] {url}: SELF-SIGNED certificate")
+                        # Store for cross-host correlation
+                        host.setdefault("cert_info", cert_info)
                 except Exception:
                     pass
+
+        # Generate basic vectors from what we found
+        vectors = vs.vectors_for_services(
+            target,
+            [{"port": p, "service": s.get("service", ""), "version": s.get("version", "")}
+             for p, s in host["services"].items()],
+        )
+        host.setdefault("attack_vectors", []).extend(vectors)
+
+        # Per-host CVE research in quick mode too
+        if state.get("cve_research", True):
+            _run_cve_research_host(state, host, target, new_findings)
+
         return
 
     # Full port scan if not done
@@ -249,15 +338,40 @@ def _enumerate_host(state, host, target, new_findings):
                 for e in exploits[:3]:
                     new_findings.append(f"  → {e['title']} [{e['type']}]")
 
-    # SSL certificate intel
+    # SSL certificate intel — enhanced with ssl_enum module
     for port, svc in host["services"].items():
         if "ssl" in svc["service"].lower() or "https" in svc["service"].lower() or port == 443:
-            cert = recon.ssl_cert_info(target, port)
-            if cert:
-                new_findings.append(f"[ENUM] {target}:{port} SSL cert: {cert}")
-                sans = cert.get("sans", [])
-                if sans:
-                    new_findings.append(f"[ENUM] {target}: cert SANs: {', '.join(sans)}")
+            if _HAS_SSL_ENUM:
+                try:
+                    cert_info = ssl_enum.extract_cert(target, port)
+                    if cert_info and cert_info.get("subject_cn"):
+                        new_findings.append(
+                            f"[CERT] {target}:{port}: CN={cert_info['subject_cn']}, "
+                            f"ORG={cert_info.get('subject_org', '?')}, "
+                            f"OU={cert_info.get('subject_ou', '?')}, "
+                            f"ISSUER={cert_info.get('issuer_cn', '?')}"
+                        )
+                        if cert_info.get("san_list"):
+                            new_findings.append(
+                                f"[CERT] {target}:{port}: SANs={', '.join(cert_info['san_list'][:5])}"
+                            )
+                        if cert_info.get("is_self_signed"):
+                            new_findings.append(f"[CERT] {target}:{port}: SELF-SIGNED")
+                        # Store for cross-host correlation
+                        host["cert_info"] = cert_info
+                except Exception:
+                    pass
+            else:
+                cert = recon.ssl_cert_info(target, port)
+                if cert:
+                    new_findings.append(f"[ENUM] {target}:{port} SSL cert: {cert}")
+                    sans = cert.get("sans", [])
+                    if sans:
+                        new_findings.append(f"[ENUM] {target}: cert SANs: {', '.join(sans)}")
+
+    # Per-host CVE research during full enumeration too
+    if state.get("cve_research", True):
+        _run_cve_research_host(state, host, target, new_findings)
 
     # DNS enumeration (if DNS port detected)
     if 53 in host["services"] or _HAS_DNS:
@@ -355,6 +469,25 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
 
     # SQLi injection point identification (passive)
     sqli_points = web.check_sqli_point(url, forms)
+
+    # Active SQLi probe — send actual payloads to confirm injection
+    if _HAS_SQLI_PROBE and forms:
+        print(f"  [>] Active SQLi probe on {url}...")
+        for form in forms[:5]:
+            try:
+                results = sqli_probe.probe_form(url, form)
+                for vuln in results:
+                    if vuln.get("is_vulnerable"):
+                        new_findings.append(
+                            f"[!] SQLI CONFIRMED: {url} param '{vuln['parameter']}' "
+                            f"via {vuln['injection_type']} — {vuln.get('evidence', [''])[0][:60]}"
+                        )
+                        vectors = sqli_probe.generate_sqli_vector(
+                            url, vuln["parameter"], vuln
+                        )
+                        host.setdefault("attack_vectors", []).extend(vectors)
+            except Exception:
+                pass
 
     # API discovery
     api_result = web.api_enumerate(url)
@@ -729,6 +862,77 @@ def _enumerate_extra_services(state, host, target, new_findings):
                 new_findings.append(f"[ENUM] {target}:{port}: FTP anonymous access, {len(files)} files")
                 for f in files[:5]:
                     new_findings.append(f"  → {f}")
+
+
+def _run_cve_research_host(state, host, target, new_findings):
+    """Per-host CVE research — runs during enumeration, not just analyze."""
+    if not _HAS_CVE_RESEARCH:
+        return
+    researched = state.setdefault("_cve_researched", set())
+
+    for port, svc in host.get("services", {}).items():
+        service_name = svc.get("service", "")
+        version = svc.get("version", "")
+        if not version or len(version) < 2:
+            continue
+
+        # Normalize version: extract just the product + version number
+        # e.g. "Apache httpd 2.4.29 ((Ubuntu))" -> service="apache", version="2.4.29"
+        import re as _re
+        ver_match = _re.search(r'(\d+\.\d+(?:\.\d+)?)', version)
+        clean_version = ver_match.group(1) if ver_match else version
+
+        # Map common service names
+        svc_lower = service_name.lower()
+        if "apache" in version.lower() or "httpd" in version.lower():
+            clean_service = "apache httpd"
+        elif "powerdns" in version.lower():
+            clean_service = "powerdns"
+        elif "openssh" in version.lower():
+            clean_service = "openssh"
+        elif "nginx" in version.lower():
+            clean_service = "nginx"
+        elif "iis" in version.lower():
+            clean_service = "iis"
+        else:
+            clean_service = service_name.split("/")[0]
+
+        research_key = f"{clean_service}:{clean_version}"
+        if research_key in researched:
+            continue
+        researched.add(research_key)
+
+        print(f"  [>] CVE research: {clean_service} {clean_version} ({target}:{port})...")
+        try:
+            cves = cve_res.search_cves(clean_service, clean_version)
+            if cves:
+                high_cves = [c for c in cves if c.get("severity") in ("HIGH", "CRITICAL")]
+                if high_cves:
+                    new_findings.append(
+                        f"[CVE] {clean_service} {clean_version} ({target}:{port}): "
+                        f"{len(high_cves)} high/critical CVEs"
+                    )
+                    for cve in high_cves[:3]:
+                        new_findings.append(
+                            f"  -> {cve['id']} (CVSS {cve.get('cvss_score', '?')}): "
+                            f"{cve.get('description', '')[:70]}"
+                        )
+                    # Generate CVE vectors
+                    for cve in high_cves[:3]:
+                        vectors = vs.vectors_for_cve(target, port, clean_service, clean_version, cve)
+                        host.setdefault("attack_vectors", []).extend(vectors)
+
+            # Exploit commands
+            commands = cve_res.generate_exploit_commands({
+                "service": clean_service, "version": clean_version,
+                "target": f"{target}:{port}",
+            })
+            if commands:
+                new_findings.append(f"[EXPLOIT-CMD] {clean_service} {clean_version}:")
+                for cmd in commands[:2]:
+                    new_findings.append(f"  -> {cmd}")
+        except Exception as e:
+            print(f"  [!] CVE research failed for {clean_service}: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1301,7 +1505,70 @@ def _generate_heuristic_report(state: ReconState, summary: str,
         for f in sorted(set(exploit_cmd_findings)):
             lines.append(f"- {f}")
 
+    # Cross-host correlation
+    lines.extend(_cross_host_correlation(state))
+
     return "\n".join(lines)
+
+
+def _cross_host_correlation(state: ReconState) -> List[str]:
+    """Analyze all hosts for shared infrastructure, SSL orgs, and relationships."""
+    lines = []
+    hosts = state.get("hosts", {})
+    if len(hosts) < 2:
+        return lines
+
+    # Collect SSL cert orgs/issuers per host
+    cert_hosts = {}  # org -> [ips]
+    for ip, host in hosts.items():
+        cert = host.get("cert_info", {})
+        if not cert:
+            continue
+        for field in ("subject_org", "issuer_org", "subject_ou", "subject_cn"):
+            val = cert.get(field, "")
+            if val and val != "Unknown":
+                cert_hosts.setdefault(val, []).append(ip)
+
+    # Find shared orgs
+    shared = {org: ips for org, ips in cert_hosts.items() if len(set(ips)) > 1}
+    if shared:
+        lines.append("\n## Cross-Host Correlation\n")
+        lines.append("### Shared SSL Certificate Organizations\n")
+        for org, ips in shared.items():
+            unique_ips = sorted(set(ips))
+            lines.append(f"- **{org}**: hosts {', '.join(unique_ips)}")
+            lines.append(f"  → These hosts likely belong to the same organization/infrastructure")
+
+    # Collect all SSL cert names for vhost suggestions
+    all_cert_names = set()
+    for ip, host in hosts.items():
+        cert = host.get("cert_info", {})
+        if cert.get("subject_cn"):
+            all_cert_names.add(cert["subject_cn"])
+        all_cert_names.update(cert.get("san_list", []))
+
+    if all_cert_names:
+        lines.append("\n### Discovered Hostnames (from SSL certs)\n")
+        for name in sorted(all_cert_names):
+            lines.append(f"- `{name}`")
+            lines.append(f"  → Add to /etc/hosts or use for vhost testing")
+
+    # Same-server headers across hosts
+    server_hosts = {}
+    for ip, host in hosts.items():
+        for wa in host.get("web_apps", []):
+            server = wa.get("server", "")
+            if server:
+                server_hosts.setdefault(server, []).append(ip)
+    shared_servers = {s: ips for s, ips in server_hosts.items() if len(set(ips)) > 1}
+    if shared_servers:
+        if not shared:  # Only add header if not already added
+            lines.append("\n## Cross-Host Correlation\n")
+        lines.append("\n### Shared Web Server Versions\n")
+        for server, ips in shared_servers.items():
+            lines.append(f"- **{server}**: {', '.join(sorted(set(ips)))}")
+
+    return lines
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
