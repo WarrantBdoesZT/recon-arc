@@ -46,6 +46,18 @@ try:
 except ImportError:
     _HAS_EXTRA = False
 
+try:
+    import tools.cve_research as cve_res
+    _HAS_CVE_RESEARCH = True
+except ImportError:
+    _HAS_CVE_RESEARCH = False
+
+try:
+    import tools.cred_test as cred
+    _HAS_CRED_TEST = True
+except ImportError:
+    _HAS_CRED_TEST = False
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # DISCOVER NODE — Find new hosts and services
@@ -169,6 +181,8 @@ def enumerate_node(state: ReconState) -> ReconState:
 
 def _enumerate_host(state, host, target, new_findings):
     """Full deep enumeration of a host: ports, services, web, AD, DNS, SNMP."""
+    quick_mode = state.get("quick_mode", False)
+
     # Full port scan if not done
     if len(host["services"]) < 5:
         print(f"  [>] Full port scan on {target}...")
@@ -179,6 +193,26 @@ def _enumerate_host(state, host, target, new_findings):
         new_findings.append(
             f"[ENUM] {target}: {len(services)} ports, OS: {os_hint}"
         )
+
+    if quick_mode:
+        # Quick mode: skip UDP, deep web, AD, SNMP — just basic web enum
+        print(f"  [QUICK] Skipping deep enumeration (quick mode)")
+        for port, svc in host["services"].items():
+            svc_name = svc.get("service", "").lower()
+            if "http" in svc_name or "ssl" in svc_name:
+                scheme = "https" if "ssl" in svc_name or port in (443, 8443) else "http"
+                url = f"{scheme}://{target}:{port}"
+                new_findings.append(f"[QUICK-ENUM] {url}: web service detected")
+                # Quick title grab
+                import requests
+                try:
+                    r = requests.get(url, timeout=5, verify=False, allow_redirects=True)
+                    title_match = re.search(r"<title>(.*?)</title>", r.text, re.I)
+                    title = title_match.group(1) if title_match else r.text[:50]
+                    new_findings.append(f"[QUICK-ENUM] {url}: title='{title}', status={r.status_code}")
+                except Exception:
+                    pass
+        return
 
     # UDP scan (top 200 ports) — catches SNMP, DNS, TFTP, NFS, NetBIOS
     print(f"  [>] UDP scan on {target}...")
@@ -698,6 +732,106 @@ def _enumerate_extra_services(state, host, target, new_findings):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# CVE RESEARCH & CREDENTIAL TESTING
+# ═══════════════════════════════════════════════════════════════════════
+
+def _run_cve_research(state: ReconState) -> List[str]:
+    """Search NVD and searchsploit for version-specific CVEs."""
+    if not _HAS_CVE_RESEARCH:
+        return []
+
+    findings = []
+    researched = set()
+
+    for ip, host in state["hosts"].items():
+        for port, svc in host.get("services", {}).items():
+            service_name = svc.get("service", "")
+            version = svc.get("version", "")
+            if not version or len(version) < 2:
+                continue
+
+            # Deduplicate by service+version
+            research_key = f"{service_name}:{version}"
+            if research_key in researched:
+                continue
+            researched.add(research_key)
+
+            print(f"  [>] CVE research: {service_name} {version} ({ip}:{port})...")
+            try:
+                cves = cve_res.search_cves(service_name, version)
+                if cves:
+                    high_cves = [c for c in cves if c.get("severity") in ("HIGH", "CRITICAL")]
+                    if high_cves:
+                        findings.append(
+                            f"[CVE] {service_name} {version} ({ip}:{port}): "
+                            f"{len(high_cves)} high/critical CVEs found"
+                        )
+                        for cve in high_cves[:5]:
+                            findings.append(
+                                f"  → {cve['id']} (CVSS {cve.get('cvss_score', '?')}: "
+                                f"{cve.get('description', '')[:80]})"
+                            )
+
+                    # Also check exploitdb
+                    exploits = cve_res.search_exploitdb_online(f"{service_name} {version}")
+                    if exploits:
+                        findings.append(
+                            f"[EXPLOIT-DB] {service_name} {version}: "
+                            f"{len(exploits)} exploits found"
+                        )
+                        for exp in exploits[:3]:
+                            findings.append(
+                                f"  → {exp.get('title', '?')} [{exp.get('type', '?')}]"
+                            )
+
+                    # Generate concrete exploit commands
+                    commands = cve_res.generate_exploit_commands({
+                        "service": service_name,
+                        "version": version,
+                        "target": f"{ip}:{port}",
+                    })
+                    if commands:
+                        findings.append(f"[EXPLOIT-CMD] Commands for {service_name} {version}:")
+                        for cmd in commands[:3]:
+                            findings.append(f"  → {cmd}")
+            except Exception as e:
+                print(f"  [!] CVE research failed for {service_name}: {e}")
+
+    return findings
+
+
+def _run_cred_test(state: ReconState) -> List[str]:
+    """Test default credentials against discovered services."""
+    if not _HAS_CRED_TEST:
+        return ["[CRED] Credential testing module not available"]
+    if not state.get("test_creds"):
+        return []
+
+    findings = []
+
+    for ip, host in state["hosts"].items():
+        services = host.get("services", {})
+        print(f"  [>] Testing default creds on {ip}...")
+        try:
+            results = cred.run_cred_scan(ip, list(services.values()))
+            for r in results:
+                if r.get("success"):
+                    findings.append(
+                        f"[CRED] ✓ VALID CREDENTIAL: {r['service']} on {ip} — "
+                        f"{r['username']}:{r['password']} ({r.get('detail', '')})"
+                    )
+                else:
+                    findings.append(
+                        f"[CRED] ✗ {r['service']} on {ip} — "
+                        f"{r['username']}:{r['password']} failed"
+                    )
+        except Exception as e:
+            print(f"  [!] Cred test failed for {ip}: {e}")
+
+    return findings
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # ANALYZE NODE — LLM-powered attack path analysis and ranking
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -708,6 +842,26 @@ def analyze_node(state: ReconState) -> ReconState:
     print("=" * 60)
 
     summary = get_engagement_summary(state)
+
+    # Run CVE research (if enabled and not already done)
+    if state.get("cve_research", True) and not state.get("_cve_research_done"):
+        print("\n  [>] Running CVE research (NVD + searchsploit)...")
+        cve_findings = _run_cve_research(state)
+        if cve_findings:
+            state["findings"] = _dedup(cve_findings, state.get("findings", []))
+            for f in cve_findings:
+                print(f"    {f}")
+        state["_cve_research_done"] = True
+
+    # Run credential testing (if enabled and not already done)
+    if state.get("test_creds") and not state.get("_cred_test_done"):
+        print("\n  [>] Testing default credentials...")
+        cred_findings = _run_cred_test(state)
+        if cred_findings:
+            state["findings"] = _dedup(cred_findings, state.get("findings", []))
+            for f in cred_findings:
+                print(f"    {f}")
+        state["_cred_test_done"] = True
 
     # Collect all findings for LLM context
     all_findings = state.get("findings", [])[-200:]
@@ -1115,6 +1269,36 @@ def _generate_heuristic_report(state: ReconState, summary: str,
         unique = sorted(set(findings))
         lines.append(f"\n## Findings ({len(unique)} unique)\n")
         for f in unique[-50:]:
+            lines.append(f"- {f}")
+
+    # CVE and Exploit Commands section
+    cve_findings = [f for f in findings if f.startswith("[CVE]") or f.startswith("[EXPLOIT")]
+    if cve_findings:
+        lines.append(f"\n## CVE Research & Exploit Commands\n")
+        lines.append("### Discovered CVEs\n")
+        for f in sorted(set(cve_findings)):
+            lines.append(f"- {f}")
+
+    # Credential test results
+    cred_findings = [f for f in findings if f.startswith("[CRED]")]
+    if cred_findings:
+        lines.append(f"\n## Credential Test Results\n")
+        valid_creds = [f for f in cred_findings if "VALID CREDENTIAL" in f]
+        if valid_creds:
+            lines.append("### ✅ Valid Credentials Found!\n")
+            for f in valid_creds:
+                lines.append(f"- **{f}**")
+        failed_creds = [f for f in cred_findings if "✗" in f]
+        if failed_creds:
+            lines.append("\n### Tested (Failed)\n")
+            for f in failed_creds[:20]:
+                lines.append(f"- {f}")
+
+    # Exploit commands from CVE research
+    exploit_cmd_findings = [f for f in findings if f.startswith("[EXPLOIT-CMD]")]
+    if exploit_cmd_findings:
+        lines.append(f"\n## Concrete Exploit Commands\n")
+        for f in sorted(set(exploit_cmd_findings)):
             lines.append(f"- {f}")
 
     return "\n".join(lines)

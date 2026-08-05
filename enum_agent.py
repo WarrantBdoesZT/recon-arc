@@ -185,6 +185,18 @@ Examples:
         "--dry-run", action="store_true",
         help="Initialize and print plan without executing",
     )
+    parser.add_argument(
+        "--test-creds", action="store_true",
+        help="Test default credentials against discovered services (splunk, pfsense, ssh, etc.)",
+    )
+    parser.add_argument(
+        "--quick", action="store_true",
+        help="Quick mode: port scan + service ID + top CVEs only (2 iterations max)",
+    )
+    parser.add_argument(
+        "--cve-research", action="store_true", default=True,
+        help="Search NVD/searchsploit for version-specific CVEs after enumeration (default: on)",
+    )
     args = parser.parse_args()
 
     print("=" * 60)
@@ -220,6 +232,10 @@ Examples:
         print(f"  Max iterations: {args.max_iterations}")
         print(f"  Wordlist:       {args.wordlist}")
         mode = "OFFLINE (heuristic-only)" if args.no_llm else "LLM-POWERED (GLM-5.2)"
+        if args.quick:
+            mode += " + QUICK"
+        if args.test_creds:
+            mode += " + CRED-TEST"
         print(f"  Mode:           {mode}")
         if args.exclude:
             print(f"  Out of scope:   {', '.join(args.exclude)}")
@@ -234,6 +250,9 @@ Examples:
             out_of_scope=args.exclude,
             no_llm=args.no_llm,
         )
+        # Store feature flags in state
+        state["test_creds"] = args.test_creds
+        state["cve_research"] = args.cve_research
 
         # If --targets specified, pre-seed them
         if args.targets:
@@ -257,6 +276,13 @@ Examples:
                     print(f"  [!] {ip}: no services detected")
             # Mark subnet as scanned
             state["scanned_subnets"] = [subnet]
+
+        # Quick mode: limit iterations and skip deep enumeration
+        if args.quick:
+            state["max_iterations"] = min(state["max_iterations"], 3)
+            state["quick_mode"] = True
+            print(f"\n[QUICK] Quick mode enabled — limited to {state['max_iterations']} iterations")
+            print("[QUICK] Deep web enum, UDP scan, and AD enum will be skipped")
 
         # Store goals in findings for context
         for goal in args.goals:
