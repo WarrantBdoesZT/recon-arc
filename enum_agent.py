@@ -253,6 +253,7 @@ Examples:
         # Store feature flags in state
         state["test_creds"] = args.test_creds
         state["cve_research"] = args.cve_research
+        state["quick_mode"] = args.quick
 
         # If --targets specified, pre-seed them
         if args.targets:

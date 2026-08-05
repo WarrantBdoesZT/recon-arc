@@ -183,19 +183,8 @@ def _enumerate_host(state, host, target, new_findings):
     """Full deep enumeration of a host: ports, services, web, AD, DNS, SNMP."""
     quick_mode = state.get("quick_mode", False)
 
-    # Full port scan if not done
-    if len(host["services"]) < 5:
-        print(f"  [>] Full port scan on {target}...")
-        services, os_hint, raw = recon.port_scan(target, fast=False)
-        host["services"] = services
-        if os_hint != "unknown":
-            host["os"] = os_hint
-        new_findings.append(
-            f"[ENUM] {target}: {len(services)} ports, OS: {os_hint}"
-        )
-
     if quick_mode:
-        # Quick mode: skip UDP, deep web, AD, SNMP — just basic web enum
+        # Quick mode: skip everything except basic web title grab
         print(f"  [QUICK] Skipping deep enumeration (quick mode)")
         for port, svc in host["services"].items():
             svc_name = svc.get("service", "").lower()
@@ -213,6 +202,17 @@ def _enumerate_host(state, host, target, new_findings):
                 except Exception:
                     pass
         return
+
+    # Full port scan if not done
+    if len(host["services"]) < 5:
+        print(f"  [>] Full port scan on {target}...")
+        services, os_hint, raw = recon.port_scan(target, fast=False)
+        host["services"] = services
+        if os_hint != "unknown":
+            host["os"] = os_hint
+        new_findings.append(
+            f"[ENUM] {target}: {len(services)} ports, OS: {os_hint}"
+        )
 
     # UDP scan (top 200 ports) — catches SNMP, DNS, TFTP, NFS, NetBIOS
     print(f"  [>] UDP scan on {target}...")

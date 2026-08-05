@@ -132,6 +132,15 @@ class ReconState(TypedDict):
     output_dir: str
     no_llm: bool                 # skip LLM calls (offline mode)
 
+    # Feature flags (v3)
+    quick_mode: bool             # --quick: skip deep enumeration
+    test_creds: bool             # --test-creds: test default credentials
+    cve_research: bool           # --cve-research: search NVD for CVEs
+
+    # Internal tracking (not persisted)
+    _cve_research_done: bool
+    _cred_test_done: bool
+
     # Session
     session_id: str
     save_path: str
@@ -179,6 +188,11 @@ def initial_state(
         wordlist=wordlist,
         output_dir=output_dir,
         no_llm=no_llm,
+        quick_mode=False,
+        test_creds=False,
+        cve_research=True,
+        _cve_research_done=False,
+        _cred_test_done=False,
         session_id=session_id,
         save_path=f"~/projects/recon-arc/saves/{session_id}.json",
     )

@@ -27,10 +27,12 @@ Usage:
 
 import re
 import shlex
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
-from utils import run_command
+import requests
+
+from utils import http_get, http_post, run_command
 
 
 # ── Default Credentials Database ──────────────────────────────────────
@@ -154,7 +156,7 @@ def test_http_auth(
 ) -> Tuple[bool, str]:
     """Test HTTP Basic or NTLM authentication against *url*.
 
-    Uses curl with ``--max-time`` for safety.
+    Uses ``requests`` with a 10-second timeout for safety.
 
     Args:
         url:      Full URL (including scheme) of the protected resource.
@@ -165,35 +167,37 @@ def test_http_auth(
     Returns:
         ``(success, detail)`` — *detail* includes the HTTP status code.
     """
-    auth_flag = '--ntlm' if auth_type.lower() == 'ntlm' else '--anyauth'
-    user_pass = shlex.quote(f'{username}:{password}')
-
-    cmd = (
-        f'curl -s -k --max-time 10 {auth_flag} '
-        f'-u {user_pass} '
-        f'-o /dev/null -w "%{{http_code}}" '
-        f'{shlex.quote(url)}'
-    )
+    # Build auth object
+    auth: Optional[requests.auth.HTTPBasicAuth]
+    auth_lower = auth_type.lower()
+    if auth_lower == 'ntlm':
+        try:
+            from requests_ntlm import HttpNtlmAuth
+            auth = HttpNtlmAuth(username, password)
+        except ImportError:
+            return (
+                False,
+                'NTLM auth requires requests-ntlm (pip install requests-ntlm)',
+            )
+    else:
+        auth = requests.auth.HTTPBasicAuth(username, password)
 
     try:
-        result = run_command(cmd, timeout=15)
+        resp = requests.get(
+            url,
+            auth=auth,
+            timeout=10,
+            verify=False,
+            allow_redirects=True,
+        )
+    except requests.exceptions.Timeout:
+        return (False, 'HTTP request timed out after 10s')
+    except requests.exceptions.ConnectionError as exc:
+        return (False, f'HTTP connection failed: {exc}')
     except Exception as exc:
-        return (False, f'curl execution error: {exc}')
+        return (False, f'HTTP request error: {exc}')
 
-    if result.get('returncode') == -1 and 'BLOCKED' in (result.get('stderr') or ''):
-        return (False, 'Blocked by safety filter')
-
-    stdout = result.get('stdout', '').strip()
-    stderr = result.get('stderr', '').strip()
-
-    # curl writes the HTTP status code to stdout via -w
-    status_code = stdout if stdout.isdigit() else ''
-
-    if not status_code:
-        # No status code — likely a connection failure
-        return (False, f'No HTTP response ({stderr or "connection failed"})')
-
-    code = int(status_code)
+    code = resp.status_code
 
     if code == 401:
         return (False, f'HTTP 401 — credentials rejected ({auth_type})')
@@ -217,10 +221,12 @@ def test_form_login(
     success_indicator: str,
     failure_indicator: str,
 ) -> Tuple[bool, str]:
-    """Test form-based login via curl POST.
+    """Test form-based login via HTTP POST.
 
     Sends a POST with the given field names and checks the response body
     for *success_indicator* or *failure_indicator* strings.
+
+    Uses ``requests`` (via ``utils.http_post``) with a 10-second timeout.
 
     Args:
         url:               Login form action URL.
@@ -234,29 +240,32 @@ def test_form_login(
     Returns:
         ``(success, detail)``.
     """
-    data = (
-        f'{username_field}={shlex.quote(username)}&'
-        f'{password_field}={shlex.quote(password)}'
-    )
+    form_data = {
+        username_field: username,
+        password_field: password,
+    }
 
-    cmd = (
-        f'curl -s -k -L --max-time 10 '
-        f'-d {shlex.quote(data)} '
-        f'-A "Mozilla/5.0" '
-        f'{shlex.quote(url)}'
-    )
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (ReconARC cred-test)',
+        'Content-Type': 'application/x-www-form-urlencoded',
+    }
 
     try:
-        result = run_command(cmd, timeout=15)
+        resp = http_post(
+            url,
+            data=form_data,
+            timeout=10,
+            headers=headers,
+        )
     except Exception as exc:
-        return (False, f'curl execution error: {exc}')
+        return (False, f'HTTP POST error: {exc}')
 
-    if result.get('returncode') == -1 and 'BLOCKED' in (result.get('stderr') or ''):
-        return (False, 'Blocked by safety filter')
+    if resp is None:
+        return (False, 'No HTTP response — login endpoint unreachable')
 
-    body = result.get('stdout', '')
+    body = resp.text
     if not body:
-        return (False, 'Empty response — login endpoint unreachable')
+        return (False, f'Empty response (HTTP {resp.status_code})')
 
     body_lower = body.lower()
 
@@ -270,7 +279,7 @@ def test_form_login(
 
     # Ambiguous response
     body_snippet = body[:200].replace('\n', ' ').strip()
-    return (False, f'Inconclusive — neither indicator matched. Response: {body_snippet}...')
+    return (False, f'Inconclusive — neither indicator matched (HTTP {resp.status_code}). Response: {body_snippet}...')
 
 
 # ── SMB Login Testing ─────────────────────────────────────────────────
@@ -442,6 +451,8 @@ def test_splunk_login(
       1. GETs the login page to extract the ``cval`` token.
       2. POSTs credentials with the token to the login endpoint.
 
+    Uses ``requests`` (via ``utils.http_get``/``http_post``) with timeouts.
+
     Args:
         url:      Base Splunk URL (e.g. ``https://host:8000``).
         username: Username to test (default Splunk admin is ``admin``).
@@ -455,66 +466,57 @@ def test_splunk_login(
     login_url = f'{base_url}/en-US/account/login'
 
     # ── Step 1: Fetch login page, extract cval ──
-    fetch_cmd = f'curl -s -k --max-time 10 {shlex.quote(login_url)}'
-
     try:
-        fetch_result = run_command(fetch_cmd, timeout=15)
+        login_page = http_get(login_url, timeout=10)
     except Exception as exc:
         return (False, f'Splunk page fetch error: {exc}')
 
-    if fetch_result.get('returncode') == -1 and 'BLOCKED' in (fetch_result.get('stderr') or ''):
-        return (False, 'Blocked by safety filter')
+    if login_page is None:
+        return (False, 'No response — Splunk login page unreachable')
 
-    page_html = fetch_result.get('stdout', '')
+    page_html = login_page.text
     if not page_html:
         return (False, 'Empty response — Splunk login page unreachable')
 
     # Extract cval CSRF token
     cval_match = re.search(r'name=["\']?cval["\']?\s+value=["\']([^"\']+)["\']', page_html)
     if not cval_match:
-        # Some Splunk versions / SSO configs may not expose cval
-        # Fall back to REST API auth endpoint
+        # Some Splunk versions / SSO configs may not expose cval.
+        # Fall back to REST API auth endpoint.
         return _splunk_rest_login(base_url, username, password)
 
     cval = cval_match.group(1)
 
     # ── Step 2: POST credentials with cval ──
-    post_data = (
-        f'cval={shlex.quote(cval)}'
-        f'&username={shlex.quote(username)}'
-        f'&password={shlex.quote(password)}'
-        f'&set_tz=UTC'
-    )
-
-    post_cmd = (
-        f'curl -s -k --max-time 10 '
-        f'-d {shlex.quote(post_data)} '
-        f'-o /dev/null -w "%{{http_code}}|%{{redirect_url}}" '
-        f'-L {shlex.quote(login_url)}'
-    )
+    post_data = {
+        'cval': cval,
+        'username': username,
+        'password': password,
+        'set_tz': 'UTC',
+    }
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (ReconARC cred-test)',
+        'Content-Type': 'application/x-www-form-urlencoded',
+    }
 
     try:
-        post_result = run_command(post_cmd, timeout=15)
+        resp = http_post(
+            login_url, data=post_data, timeout=10, headers=headers,
+        )
     except Exception as exc:
         return (False, f'Splunk POST error: {exc}')
 
-    stdout = post_result.get('stdout', '').strip()
-
-    # Parse curl output: "status_code|redirect_url"
-    parts = stdout.split('|', 1)
-    status_code = parts[0] if parts and parts[0].isdigit() else ''
-    redirect_url = parts[1] if len(parts) > 1 else ''
-
-    if not status_code:
+    if resp is None:
         return (False, 'No HTTP response from Splunk login POST')
 
-    code = int(status_code)
+    code = resp.status_code
 
-    # Splunk redirects to /en-US/app/launcher/ on success
-    if code in (200, 302) and ('launcher' in redirect_url.lower() or 'app' in redirect_url.lower()):
-        return (True, f'Splunk login successful (HTTP {code}, redirect to {redirect_url})')
+    # On success Splunk redirects to /en-US/app/launcher/ (302 → 200)
+    final_url = resp.url.lower()
+    if code in (200, 302) and ('launcher' in final_url or '/app/' in final_url):
+        return (True, f'Splunk login successful (HTTP {code}, landed on {resp.url})')
 
-    if code == 200 and 'account/login' not in redirect_url.lower():
+    if code == 200 and 'account/login' not in final_url:
         # Followed redirect successfully — likely logged in
         return (True, f'Splunk login successful (HTTP {code})')
 
@@ -523,45 +525,38 @@ def test_splunk_login(
     if code == 403:
         return (False, 'Splunk login failed — HTTP 403 (forbidden)')
 
-    return (False, f'Splunk login inconclusive — HTTP {code} (redirect: {redirect_url})')
+    return (False, f'Splunk login inconclusive — HTTP {code} (final URL: {resp.url})')
 
 
 def _splunk_rest_login(base_url: str, username: str, password: str) -> Tuple[bool, str]:
     """Fallback: test Splunk credentials via the REST API auth endpoint.
 
     POSTs to ``/services/auth/login`` — returns a session key on success.
+    Uses ``requests`` (via ``utils.http_post``).
     """
-    rest_url = f'{base_url.rstrip("/")}/services/auth/login'
     # Determine if we should use the management port (8089) for REST
     parsed = urlparse(base_url)
+    rest_url = f'{base_url.rstrip("/")}/services/auth/login'
     if parsed.port == 8000:
         # Web port — try management port for REST
         rest_url = f'{parsed.scheme}://{parsed.hostname}:8089/services/auth/login'
 
-    post_data = f'username={shlex.quote(username)}&password={shlex.quote(password)}'
-
-    cmd = (
-        f'curl -s -k --max-time 10 '
-        f'-d {shlex.quote(post_data)} '
-        f'-o /dev/null -w "%{{http_code}}" '
-        f'{shlex.quote(rest_url)}'
-    )
+    post_data = {'username': username, 'password': password}
 
     try:
-        result = run_command(cmd, timeout=15)
+        resp = http_post(rest_url, data=post_data, timeout=10)
     except Exception as exc:
         return (False, f'Splunk REST error: {exc}')
 
-    stdout = result.get('stdout', '').strip()
-    if stdout.isdigit():
-        code = int(stdout)
-        if code == 200:
-            return (True, f'Splunk REST login successful (HTTP {code})')
-        if code == 401:
-            return (False, f'Splunk REST login failed — HTTP 401 (wrong credentials)')
-        return (False, f'Splunk REST login — HTTP {code}')
+    if resp is None:
+        return (False, 'Splunk REST endpoint unreachable')
 
-    return (False, 'Splunk REST endpoint unreachable')
+    code = resp.status_code
+    if code == 200:
+        return (True, f'Splunk REST login successful (HTTP {code})')
+    if code == 401:
+        return (False, f'Splunk REST login failed — HTTP 401 (wrong credentials)')
+    return (False, f'Splunk REST login — HTTP {code}')
 
 
 # ── Credential Scan Orchestrator ──────────────────────────────────────
