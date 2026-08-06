@@ -135,6 +135,25 @@ def _has_error(text: str) -> Optional[str]:
     return None
 
 
+_DB_PATTERNS = [
+    ("mysql",      [r"mysql", r"mysqli?", r"sql syntax.*mysql"]),
+    ("postgresql", [r"postgresql", r"pg_query", r"psql"]),
+    ("mssql",      [r"microsoft sql server", r"sql server", r"odbc sql server"]),
+    ("oracle",     [r"oracle", r"ora-\d{5}"]),
+    ("sqlite",     [r"sqlite", r"sqlite3"]),
+]
+
+
+def _fingerprint_db_from_text(text: str) -> Optional[str]:
+    """Identify database type from error message text."""
+    lower = (text or "").lower()
+    for db_name, patterns in _DB_PATTERNS:
+        for pat in patterns:
+            if re.search(pat, lower):
+                return db_name
+    return None
+
+
 # ── (1) probe_param ───────────────────────────────────────────────────
 
 def probe_param(
@@ -197,6 +216,13 @@ def probe_param(
         f"value={param_value!r}"
     )
 
+    # Capture DB type from baseline error messages (some apps leak errors)
+    base_db = _fingerprint_db_from_text(baseline.get("text", ""))
+    if base_db:
+        result["evidence"].append(
+            f"DB fingerprint from baseline: {base_db}"
+        )
+
     # Track boolean pair separately for size comparison.
     bool_true:  Optional[Dict] = None
     bool_false: Optional[Dict] = None
@@ -237,6 +263,15 @@ def probe_param(
                 result["injection_type"] = inj_type
             elif inj_type == "error":
                 result["injection_type"] = "error"  # error is most definitive
+
+            # Capture DB type from error response
+            if inj_type == "error":
+                db_guess = _fingerprint_db_from_text(measurement.get("text", ""))
+                if db_guess:
+                    result["evidence"].append(
+                        f"DB FINGERPRINT: {db_guess} (from error response)"
+                    )
+                    result["db_type"] = db_guess
 
     # ── boolean cross-check: compare true vs false payloads ──
     if bool_true and bool_false and bool_true["ok"] and bool_false["ok"]:
@@ -293,9 +328,32 @@ def probe_form(url: str, form_dict: Dict) -> List[Dict]:
     target_url = urljoin(url, action) if not action.startswith("http") else action
 
     vulns: List[Dict] = []
+    # Extract known select option values from raw_fields if available
+    raw_fields = form_dict.get("raw_fields", [])
+    field_defaults = {}
+    for rf in raw_fields:
+        fname = rf.get("name", "")
+        ftype = rf.get("type", "")
+        if "select" in ftype.lower() or "textarea" in ftype.lower():
+            # Try the first option value if provided
+            options = rf.get("options", [])
+            if options:
+                first_val = options[0].get("value", "") if isinstance(options[0], dict) else str(options[0])
+                if first_val:
+                    field_defaults[fname] = first_val
+    
     for field in fields:
-        # Inject into one field at a time; keep other fields at default values.
-        extra = {f: "test" for f in fields if f != field}
+        # Inject into one field at a time; keep other fields at reasonable defaults.
+        extra = {}
+        for f in fields:
+            if f != field:
+                # Use known select option, or common defaults
+                if f in field_defaults:
+                    extra[f] = field_defaults[f]
+                elif f.lower() in ("type", "category", "filter"):
+                    extra[f] = "username"  # Common select default
+                else:
+                    extra[f] = "test"
         result = probe_param(
             url=target_url,
             method=method,

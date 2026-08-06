@@ -70,6 +70,24 @@ try:
 except ImportError:
     _HAS_SSL_ENUM = False
 
+try:
+    import tools.caldav_enum as caldav
+    _HAS_CALDAV = True
+except ImportError:
+    _HAS_CALDAV = False
+
+try:
+    import tools.lfi_probe as lfi_probe
+    _HAS_LFI_PROBE = True
+except ImportError:
+    _HAS_LFI_PROBE = False
+
+try:
+    import tools.attack_chains as chain_mod
+    _HAS_CHAINS = True
+except ImportError:
+    _HAS_CHAINS = False
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # DISCOVER NODE — Find new hosts and services
@@ -303,16 +321,23 @@ def _enumerate_host(state, host, target, new_findings):
             f"[ENUM] {target}: {len(services)} ports, OS: {os_hint}"
         )
 
-    # UDP scan (top 200 ports) — catches SNMP, DNS, TFTP, NFS, NetBIOS
-    print(f"  [>] UDP scan on {target}...")
-    udp_services = recon.udp_scan(target)
-    if udp_services:
-        for port, svc in udp_services.items():
-            if port not in host["services"]:
-                host["services"][port] = svc
-                new_findings.append(
-                    f"[ENUM] {target}: UDP {port}/{svc['service']} discovered"
-                )
+    # UDP scan (top 200 ports) — skip on clearly single-service web hosts
+    tcp_ports = set(host["services"].keys())
+    web_only = tcp_ports <= {80, 443, 8080, 8443}
+    has_infra = bool(tcp_ports & {53, 88, 135, 139, 389, 445, 464, 636,
+                                   1433, 2049, 3268, 3269, 3389})
+    if web_only and len(tcp_ports) <= 2 and not has_infra:
+        print(f"  [>] Skipping UDP scan on {target} (web-only host, unlikely to have useful UDP services)")
+    else:
+        print(f"  [>] UDP scan on {target}...")
+        udp_services = recon.udp_scan(target)
+        if udp_services:
+            for port, svc in udp_services.items():
+                if port not in host["services"]:
+                    host["services"][port] = svc
+                    new_findings.append(
+                        f"[ENUM] {target}: UDP {port}/{svc['service']} discovered"
+                    )
 
     # Deep service enumeration
     print(f"  [>] Deep service enumeration on {target}...")
@@ -339,6 +364,7 @@ def _enumerate_host(state, host, target, new_findings):
                     new_findings.append(f"  → {e['title']} [{e['type']}]")
 
     # SSL certificate intel — enhanced with ssl_enum module
+    cert_domains = []  # Track domains discovered from SSL certs
     for port, svc in host["services"].items():
         if "ssl" in svc["service"].lower() or "https" in svc["service"].lower() or port == 443:
             if _HAS_SSL_ENUM:
@@ -359,6 +385,45 @@ def _enumerate_host(state, host, target, new_findings):
                             new_findings.append(f"[CERT] {target}:{port}: SELF-SIGNED")
                         # Store for cross-host correlation
                         host["cert_info"] = cert_info
+
+                        # ── Intel feedback loop ─────────────────────────────
+                        # Extract domain names from cert CN and SAN list
+                        for name_field in ["subject_cn"] + cert_info.get("san_list", []):
+                            name = name_field.strip()
+                            if name.startswith("*."):
+                                name = name[2:]  # wildcard → base domain
+                            if "." in name and "localhost" not in name and name not in cert_domains:
+                                cert_domains.append(name)
+                                state.setdefault("_discovered_domains", set()).add(name)
+
+                        # ── Immediately use cert domains for DNS enum ──────
+                        if cert_domains and (53 in host["services"] or _HAS_DNS):
+                            for domain in cert_domains[:3]:
+                                new_findings.append(
+                                    f"[INTEL] {target}: SSL cert reveals domain '{domain}' — attempting DNS zone transfer"
+                                )
+                                try:
+                                    zt = dns.zone_transfer(target, domain)
+                                    if zt and zt.get("records"):
+                                        new_findings.append(
+                                            f"[!] DNS zone transfer SUCCESS on {target} for {domain}! "
+                                            f"{len(zt['records'])} records"
+                                        )
+                                        for rec in zt["records"][:10]:
+                                            new_findings.append(f"  → {rec}")
+                                except Exception:
+                                    pass
+                                # Subdomain brute using discovered domain
+                                try:
+                                    subs = dns.subdomain_bruteforce(target, domain)
+                                    if subs:
+                                        new_findings.append(
+                                            f"[INTEL] {target}: Subdomains of {domain}: {', '.join(subs[:10])}"
+                                        )
+                                        for sub in subs[:5]:
+                                            state.setdefault("_discovered_domains", set()).add(sub)
+                                except Exception:
+                                    pass
                 except Exception:
                     pass
             else:
@@ -368,6 +433,10 @@ def _enumerate_host(state, host, target, new_findings):
                     sans = cert.get("sans", [])
                     if sans:
                         new_findings.append(f"[ENUM] {target}: cert SANs: {', '.join(sans)}")
+
+    # Store cert domains for vhost brute later
+    if cert_domains:
+        host["_cert_domains"] = cert_domains
 
     # Per-host CVE research during full enumeration too
     if state.get("cve_research", True):
@@ -418,6 +487,25 @@ def _enumerate_host(state, host, target, new_findings):
     # Database/service checks
     if _HAS_EXTRA:
         _enumerate_extra_services(state, host, target, new_findings)
+
+
+_DB_ERROR_PATTERNS = [
+    ("mysql",      [r"mysql", r"mysqli?", r"sql syntax.*mysql", r"MySQLSyntaxErrorException", r"valid MySQL result"]),
+    ("postgresql", [r"postgresql", r"pg_query", r"psql", r"unterminated quoted string.*postgres"]),
+    ("mssql",      [r"microsoft sql server", r"sql server", r"\\[sql server\\]", r"odbc sql server", r"mssql_query"]),
+    ("oracle",     [r"oracle", r"ora-\\d{5}", r"oci_parse"]),
+    ("sqlite",     [r"sqlite", r"sqlite3", r"sqlitesyntaxexception"]),
+]
+
+
+def _fingerprint_db_from_evidence(evidence: List[str]) -> Optional[str]:
+    """Extract database type from SQLi probe evidence strings."""
+    combined = " ".join(evidence).lower()
+    for db_name, patterns in _DB_ERROR_PATTERNS:
+        for pat in patterns:
+            if re.search(pat, combined):
+                return db_name
+    return None
 
 
 def _enumerate_web(state, host, target, port, svc, new_findings):
@@ -471,6 +559,7 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
     sqli_points = web.check_sqli_point(url, forms)
 
     # Active SQLi probe — send actual payloads to confirm injection
+    confirmed_sqli_params = set()
     if _HAS_SQLI_PROBE and forms:
         print(f"  [>] Active SQLi probe on {url}...")
         for form in forms[:5]:
@@ -478,16 +567,110 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
                 results = sqli_probe.probe_form(url, form)
                 for vuln in results:
                     if vuln.get("is_vulnerable"):
+                        param = vuln.get("parameter", "?")
+                        confirmed_sqli_params.add(param)
+                        # DB fingerprinting from error evidence
+                        db_type = _fingerprint_db_from_evidence(vuln.get("evidence", []))
+                        db_tag = f" [{db_type}]" if db_type else ""
                         new_findings.append(
-                            f"[!] SQLI CONFIRMED: {url} param '{vuln['parameter']}' "
-                            f"via {vuln['injection_type']} — {vuln.get('evidence', [''])[0][:60]}"
+                            f"[SQLI-CONFIRMED]{db_tag} {url} param '{param}' "
+                            f"via {vuln['injection_type']} — "
+                            f"{vuln.get('evidence', [''])[0][:80]}"
                         )
                         vectors = sqli_probe.generate_sqli_vector(
+                            url, param, vuln
+                        )
+                        # Ensure confirmed vectors get high scores
+                        for v in vectors:
+                            v["score"] = max(v.get("score", 0), 85)
+                            v["confidence"] = "high"
+                            if db_type:
+                                v["title"] = v.get("title", "") + f" ({db_type})"
+                        host.setdefault("attack_vectors", []).extend(vectors)
+                        print(f"    [+] SQLI CONFIRMED: {param} via {vuln['injection_type']}{db_tag}")
+            except Exception as e:
+                print(f"    [!] SQLi probe error on {url}: {e}")
+
+    # Remove passive (low-score) SQLi vectors for params we confirmed actively
+    if confirmed_sqli_params:
+        host["attack_vectors"] = [
+            v for v in host.get("attack_vectors", [])
+            if not (
+                v.get("vector_type") == "sqli"
+                and v.get("score", 0) < 70
+                and any(p in v.get("title", "").lower() for p in confirmed_sqli_params)
+            )
+        ]
+
+    # Active LFI / path traversal probe — test parameters for file inclusion
+    if _HAS_LFI_PROBE and forms:
+        for form in forms[:3]:
+            try:
+                lfi_results = lfi_probe.probe_form(url, form)
+                for vuln in lfi_results:
+                    if vuln.get("is_vulnerable"):
+                        new_findings.append(
+                            f"[LFI-CONFIRMED] {url} param '{vuln['parameter']}' "
+                            f"via {vuln.get('injection_type', 'LFI')} — "
+                            f"{vuln.get('evidence', [''])[0][:80]}"
+                        )
+                        vector = lfi_probe.generate_lfi_vector(
                             url, vuln["parameter"], vuln
                         )
-                        host.setdefault("attack_vectors", []).extend(vectors)
-            except Exception:
-                pass
+                        host.setdefault("attack_vectors", []).append(vector)
+                        print(f"    [+] LFI CONFIRMED: {vuln['parameter']}")
+            except Exception as e:
+                print(f"    [!] LFI probe error: {e}")
+
+    # Also probe URL query parameters for LFI
+    if _HAS_LFI_PROBE:
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(url)
+        if parsed.query:
+            qs = parse_qs(parsed.query)
+            for param_name, param_vals in qs.items():
+                try:
+                    lfi_result = lfi_probe.probe_param(url, "GET", param_name, param_vals[0] if param_vals else "test")
+                    if lfi_result.get("is_vulnerable"):
+                        new_findings.append(
+                            f"[LFI-CONFIRMED] {url} param '{param_name}' "
+                            f"via {lfi_result.get('injection_type', 'LFI')}"
+                        )
+                        vector = lfi_probe.generate_lfi_vector(url, param_name, lfi_result)
+                        host.setdefault("attack_vectors", []).append(vector)
+                        print(f"    [+] LFI CONFIRMED: {param_name}")
+                except Exception:
+                    pass
+
+    # CalDAV / Radicale enumeration for HTTPS or DAV-capable services
+    if _HAS_CALDAV and (port == 443 or port == 80 or "caldav" in svc_name.lower()):
+        try:
+            caldav_result = caldav.run(url)
+            if caldav_result.get("is_caldav"):
+                new_findings.append(
+                    f"[CALDAV] {url}: CalDAV server detected — "
+                    f"DAV: {caldav_result.get('dav_header', '?')}"
+                )
+                if caldav_result.get("unauthenticated_access"):
+                    new_findings.append(
+                        f"[!] {url}: Unauthenticated CalDAV access — "
+                        f"{len(caldav_result.get('calendars', []))} calendars"
+                    )
+                for cal_info in caldav_result.get("calendars", [])[:5]:
+                    new_findings.append(
+                        f"  → Calendar: {cal_info.get('url', '?')} "
+                        f"({cal_info.get('displayname', '?')})"
+                    )
+                if caldav_result.get("default_creds_work"):
+                    for dc in caldav_result["default_creds_work"]:
+                        new_findings.append(
+                            f"[CRED] {url}: CalDAV default cred {dc}"
+                        )
+                # Generate CalDAV attack vectors
+                cal_vectors = caldav.generate_caldav_vectors(url, caldav_result)
+                host.setdefault("attack_vectors", []).extend(cal_vectors)
+        except Exception:
+            pass
 
     # API discovery
     api_result = web.api_enumerate(url)
@@ -584,7 +767,12 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
     # Vhost brute-forcing (only on first web port)
     if port == 80 or port == 443:
         print(f"  [>] Vhost brute-forcing {target}...")
-        vhosts = web.vhost_bruteforce(target)
+        # Use cert-derived domains + globally discovered domains for targeted vhost brute
+        vhost_domains = list(host.get("_cert_domains", []))
+        # Also pull domains discovered from other hosts' SSL certs
+        global_domains = state.get("_discovered_domains", set())
+        vhost_domains.extend(global_domains - set(vhost_domains))
+        vhosts = web.vhost_bruteforce(target, extra_domains=vhost_domains[:10])
         for vh in vhosts:
             new_findings.append(f"[ENUM] {target}: Vhost discovered: {vh}")
 
@@ -1005,14 +1193,22 @@ def _run_cve_research(state: ReconState) -> List[str]:
 
 
 def _run_cred_test(state: ReconState) -> List[str]:
-    """Test default credentials against discovered services."""
+    """Test default credentials against discovered services.
+    
+    After finding valid creds on any host, immediately:
+    1. Record them as Credential objects in state
+    2. Test them against ALL services on ALL hosts (cred reuse)
+    3. Run authenticated web scanning on hosts where HTTP Basic worked
+    """
     if not _HAS_CRED_TEST:
         return ["[CRED] Credential testing module not available"]
     if not state.get("test_creds"):
         return []
 
     findings = []
+    valid_creds = []  # (username, password, source_service, source_ip)
 
+    # Phase 1: Standard cred scan per host
     for ip, host in state["hosts"].items():
         services = host.get("services", {})
         print(f"  [>] Testing default creds on {ip}...")
@@ -1024,6 +1220,15 @@ def _run_cred_test(state: ReconState) -> List[str]:
                         f"[CRED] ✓ VALID CREDENTIAL: {r['service']} on {ip} — "
                         f"{r['username']}:{r['password']} ({r.get('detail', '')})"
                     )
+                    valid_creds.append((r["username"], r["password"], r["service"], ip))
+                    # Store as Credential in state
+                    state.setdefault("credentials", []).append({
+                        "username": r["username"],
+                        "password": r["password"],
+                        "source_host": ip,
+                        "source_service": r["service"],
+                        "valid_on": [ip],
+                    })
                 else:
                     findings.append(
                         f"[CRED] ✗ {r['service']} on {ip} — "
@@ -1032,6 +1237,107 @@ def _run_cred_test(state: ReconState) -> List[str]:
         except Exception as e:
             print(f"  [!] Cred test failed for {ip}: {e}")
 
+    # Phase 2: Credential reuse — test valid creds against ALL hosts' services
+    if valid_creds:
+        print(f"\n  [>] Testing {len(valid_creds)} valid cred(s) against all hosts (cred reuse)...")
+        for username, password, src_svc, src_ip in valid_creds:
+            for ip, host in state["hosts"].items():
+                if ip == src_ip:
+                    continue  # Already tested on source
+                services = host.get("services", {})
+                for port, svc in services.items():
+                    svc_name = svc.get("service", "").lower()
+                    # Test HTTP Basic on web services
+                    if "http" in svc_name or "ssl" in svc_name or port in (80, 443, 8080, 8443):
+                        scheme = "https" if ("ssl" in svc_name or "https" in svc_name or port == 443) else "http"
+                        url = f"{scheme}://{ip}:{port}"
+                        try:
+                            import requests as _req
+                            r = _req.get(url, auth=(username, password),
+                                        timeout=5, verify=False, allow_redirects=False)
+                            if r.status_code == 200:
+                                findings.append(
+                                    f"[CRED-REUSE] ✓ {username}:{password} works on {url} "
+                                    f"(HTTP 200 — reused from {src_ip})"
+                                )
+                                # Update credential record
+                                for cred_rec in state.get("credentials", []):
+                                    if cred_rec["username"] == username and cred_rec["password"] == password:
+                                        if ip not in cred_rec["valid_on"]:
+                                            cred_rec["valid_on"].append(ip)
+                        except Exception:
+                            pass
+                    # Test SSH
+                    elif "ssh" in svc_name or port == 22:
+                        try:
+                            import paramiko
+                            client = paramiko.SSHClient()
+                            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                            client.connect(ip, port=port, username=username, password=password, timeout=5)
+                            findings.append(
+                                f"[CRED-REUSE] ✓ {username}:{password} SSH works on {ip}:{port} "
+                                f"(reused from {src_ip})"
+                            )
+                            client.close()
+                        except Exception:
+                            pass
+
+    # Phase 3: Authenticated web scanning on hosts where HTTP Basic worked
+    for username, password, src_svc, src_ip in valid_creds:
+        host = state["hosts"].get(src_ip, {})
+        if not host:
+            continue
+        for port, svc in host.get("services", {}).items():
+            svc_name = svc.get("service", "").lower()
+            if "http" in svc_name or "ssl" in svc_name or port in (80, 443):
+                scheme = "https" if ("ssl" in svc_name or "https" in svc_name or port == 443) else "http"
+                url = f"{scheme}://{src_ip}:{port}"
+                print(f"  [>] Authenticated scan on {url} with {username}:{password}...")
+                auth_findings = _authenticated_web_scan(url, username, password)
+                findings.extend(auth_findings)
+
+    return findings
+
+
+def _authenticated_web_scan(url: str, username: str, password: str) -> List[str]:
+    """Scan web app with HTTP Basic auth — discover admin panels, uploads, etc."""
+    findings = []
+    try:
+        import requests as _req
+        auth = (username, password)
+        
+        # Fetch authenticated pages
+        auth_paths = [
+            "/admin", "/admin/", "/administrator/", "/dashboard",
+            "/panel", "/manage", "/console", "/upload",
+            "/admin/upload", "/admin/users", "/admin/config",
+            "/phpmyadmin", "/adminer", "/wp-admin/",
+        ]
+        for path in auth_paths:
+            try:
+                r = _req.get(f"{url}{path}", auth=auth, timeout=5, verify=False, allow_redirects=True)
+                if r.status_code == 200 and len(r.text) > 200:
+                    # Check for interesting content
+                    title_match = re.search(r"<title>(.*?)</title>", r.text, re.I)
+                    title = title_match.group(1).strip() if title_match else ""
+                    findings.append(
+                        f"[AUTH-SCAN] {url}{path}: HTTP 200 ({len(r.text)}b) "
+                        f"title='{title}' — authenticated content accessible"
+                    )
+                    # Look for upload forms
+                    if "upload" in r.text.lower() or "file" in r.text.lower() and "input" in r.text.lower():
+                        findings.append(
+                            f"[!] {url}{path}: Upload form detected behind auth!"
+                        )
+                    # Look for user/data tables
+                    if any(kw in r.text.lower() for kw in ["user", "password", "email", "credential"]):
+                        findings.append(
+                            f"[!] {url}{path}: User/credential data visible behind auth!"
+                        )
+            except Exception:
+                pass
+    except ImportError:
+        pass
     return findings
 
 
@@ -1532,6 +1838,36 @@ def _generate_heuristic_report(state: ReconState, summary: str,
 
     # Cross-host correlation
     lines.extend(_cross_host_correlation(state))
+
+    # ── Attack Chains (v6) ──────────────────────────────────────────
+    if _HAS_CHAINS:
+        try:
+            chains = chain_mod.compose_chains(
+                vectors, state.get("credentials", []),
+                state.get("hosts", {}), state.get("topology", {}),
+            )
+            if chains:
+                lines.append(f"\n## Attack Chains ({len(chains)} identified)\n")
+                lines.append("_Multi-step compromise paths chaining individual vectors._\n")
+                chain_lines = chain_mod.format_chains_for_report(chains)
+                lines.extend(chain_lines)
+        except Exception as e:
+            lines.append(f"\n<!-- Attack chain composition failed: {e} -->")
+
+    # ── Credential Reuse Map (v6) ───────────────────────────────────
+    cred_reuse = [f for f in findings if "[CRED-REUSE]" in f]
+    if cred_reuse:
+        lines.append(f"\n## Credential Reuse Results\n")
+        for f in sorted(set(cred_reuse)):
+            lines.append(f"- **{f}**")
+
+    # ── Authenticated Scan Results (v6) ─────────────────────────────
+    auth_scan = [f for f in findings if "[AUTH-SCAN]" in f]
+    if auth_scan:
+        lines.append(f"\n## Authenticated Content Discovery\n")
+        lines.append("_Content found behind valid credentials._\n")
+        for f in sorted(set(auth_scan)):
+            lines.append(f"- {f}")
 
     return "\n".join(lines)
 

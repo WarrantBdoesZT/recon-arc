@@ -384,25 +384,46 @@ def subdomain_bruteforce(
 
     discovered: List[str] = []
 
-    for word in wordlist:
+    def _try_subdomain(word: str) -> Optional[str]:
+        """Resolve a single subdomain candidate."""
         word = str(word).strip().lower()
         if not word:
-            continue
+            return None
         fqdn = f"{word}.{domain}"
-        cmd = f"dig @{target_ip} {fqdn} +short"
+        cmd = f"dig @{target_ip} {fqdn} +short +time=3 +tries=1"
         try:
-            proc = run_command(cmd, timeout=10)
-        except Exception as exc:
-            print(f"    [+] DNS: lookup {fqdn} failed: {exc}")
-            continue
+            proc = run_command(cmd, timeout=5)
+            stdout = (proc.get("stdout", "") or "").strip()
+            # Filter out DNS error messages (timeouts, SERVFAIL, etc.)
+            if stdout and not any(
+                err in stdout.lower() for err in [
+                    "timed out", "communications error", "connection refused",
+                    "no servers", "server can't find", "not found",
+                ]
+            ):
+                # Validate it looks like an IP or CNAME
+                first = stdout.splitlines()[0].strip()
+                if re.match(r"^\d+\.\d+\.\d+\.\d+$", first) or "." in first:
+                    return f"{fqdn} -> {first}"
+        except Exception:
+            pass
+        return None
 
-        stdout = (proc.get("stdout", "") or "").strip()
-        if stdout:
-            # +short prints IP(s) for A, target for CNAME, etc. Any non-empty
-            # answer means the name resolves.
-            discovered.append(fqdn)
-            first = stdout.splitlines()[0].strip()
-            print(f"    [+] DNS: FOUND {fqdn} -> {first}")
+    # Parallel subdomain resolution with thread pool
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    try:
+        with ThreadPoolExecutor(max_workers=15) as pool:
+            futures = {pool.submit(_try_subdomain, w): w for w in wordlist}
+            for future in as_completed(futures, timeout=60):
+                try:
+                    result = future.result(timeout=5)
+                    if result:
+                        discovered.append(result)
+                        print(f"    [+] DNS: FOUND {result}")
+                except Exception:
+                    pass
+    except Exception:
+        pass  # Timeout — we have what we have
 
     print(f"    [+] DNS: subdomain brute-force complete — {len(discovered)} found")
     return sorted(set(discovered))

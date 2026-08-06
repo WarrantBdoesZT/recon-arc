@@ -357,18 +357,31 @@ def vhost_bruteforce(
     ip: str,
     wordlist: str = "/usr/share/wordlists/dirb/common.txt",
     max_time: int = 30,
+    extra_domains: List[str] = None,
 ) -> List[str]:
-    """Discover virtual hosts via Host header manipulation.
-    
-    Uses a thread pool and a HARD total timeout to prevent hanging on
-    slow/unresponsive hosts.  Max 30 seconds regardless of wordlist size.
+    """Brute-force virtual hosts on the target IP.
+
+    Uses common vhost prefixes combined with any domains discovered from SSL
+    certs or DNS enumeration (``extra_domains``).  Runs in parallel with a
+    hard ``max_time`` cap to prevent hangs.
     """
     import time
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    # Build candidate domain list
     domains = set()
+
+    # Cert-derived / discovered domains (high priority)
+    if extra_domains:
+        for d in extra_domains:
+            domains.add(d)
+            domains.add(f"www.{d}")
+
+    # Build candidate domain list — include cert-derived domains as suffixes
     base_domains = ["htb", "local", "internal", "corp", "lab", "test"]
+    # If we have cert domains, also use them as suffixes for common prefixes
+    if extra_domains:
+        for d in extra_domains:
+            base_domains.append(d)
 
     try:
         with open(wordlist) as f:

@@ -275,7 +275,16 @@ def nmap_vuln_scripts(target_ip: str) -> List[dict]:
 
 
 def nuclei_scan(target_ip: str, port: int = None, use_ssl: bool = False) -> List[dict]:
-    """Run nuclei templates for known vulnerabilities (read-only templates)."""
+    """Run nuclei templates for known vulnerabilities (read-only templates).
+
+    Checks if nuclei is installed first — avoids wasting 120s timeout on
+    hosts where nuclei isn't available.
+    """
+    # Check if nuclei is installed
+    import shutil as _shutil
+    if not _shutil.which("nuclei"):
+        return []
+
     scheme = "https" if use_ssl else "http"
     port_str = f":{port}" if port else ""
     target_url = f"{scheme}://{target_ip}{port_str}"
