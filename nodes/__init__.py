@@ -536,19 +536,22 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
             # Search for flag patterns
             import re as _re
             flag_patterns = [r'DANTE\{[^}]+\}', r'FLAG\{[^}]+\}', r'HTB\{[^}]+\}', r'CTF\{[^}]+\}']
+            existing_flags = {f.get("flag_value") for f in state.get("flags_captured", [])}
             for pattern in flag_patterns:
                 flags_found = _re.findall(pattern, robots_content)
                 for flag in flags_found:
-                    new_findings.append(f"[FLAG] 🚩 {flag} (found in robots.txt)")
-                    state["flags_captured"] = state.get("flags_captured", []) + [{
-                        "host_ip": target,
-                        "flag_type": "robots",
-                        "flag_value": flag,
-                        "path": f"{url}/robots.txt",
-                        "captured_at": __import__("time").strftime("%Y-%m-%dT%H:%M:%S"),
-                        "method": "robots.txt scan",
-                    }]
-                    state["flags_found_count"] = state.get("flags_found_count", 0) + 1
+                    if flag not in existing_flags:
+                        new_findings.append(f"[FLAG] 🚩 {flag} (found in robots.txt)")
+                        state["flags_captured"] = state.get("flags_captured", []) + [{
+                            "host_ip": target,
+                            "flag_type": "robots",
+                            "flag_value": flag,
+                            "path": f"{url}/robots.txt",
+                            "captured_at": __import__("time").strftime("%Y-%m-%dT%H:%M:%S"),
+                            "method": "robots.txt scan",
+                        }]
+                        state["flags_found_count"] = state.get("flags_found_count", 0) + 1
+                        existing_flags.add(flag)
 
             # Extract Disallow paths for further enumeration
             disallowed = _re.findall(r'(?:Disallow|Allow):\s*(.+)', robots_content)
@@ -568,8 +571,8 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
     ]
     for wp_path in wp_paths:
         try:
-            wp_resp = _req.get(wp_path, timeout=5, verify=False, allow_redirects=False)
-            if wp_resp.status_code == 200 and 'wp-login' in wp_resp.text.lower():
+            wp_resp = _req.get(wp_path, timeout=15, verify=False, allow_redirects=False)
+            if wp_resp.status_code == 200 and ('wp-login' in wp_resp.text.lower() or 'wordpress' in wp_resp.text.lower()[:500]):
                 wp_base = wp_path.rsplit('/wp-login.php', 1)[0]
                 new_findings.append(f"[CMS] WordPress detected at {wp_base}")
                 wp_detected = True
