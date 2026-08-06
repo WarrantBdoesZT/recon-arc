@@ -1236,6 +1236,31 @@ def scope_node(state: ReconState) -> ReconState:
             state["_analysis_done"] = True
             return {**state, "current_phase": "analyze"}
 
+    # Priority 3.5: Post-exploitation on compromised hosts
+    compromised = state.get("compromised_hosts", {})
+    unenumerated_compromised = {
+        ip: ch for ip, ch in compromised.items()
+        if not ch.get("enumerated")
+    }
+    if unenumerated_compromised:
+        target_ip = list(unenumerated_compromised.keys())[0]
+        print(f"\n  → ACTION: Post-exploit enumerate {target_ip}")
+        return {**state, "current_target": target_ip, "current_phase": "post_exploit"}
+
+    # Priority 3.6: Pivot to newly discovered internal networks
+    new_subnets = []
+    for ip, ch in compromised.items():
+        if ch.get("enumerated"):
+            for subnet in ch.get("discovered_subnets", []):
+                if subnet not in state.get("scanned_subnets", []) and subnet not in new_subnets:
+                    new_subnets.append(subnet)
+    if new_subnets:
+        print(f"\n  → ACTION: Pivot — discover internal network {new_subnets[0]}")
+        for s in new_subnets:
+            if s not in state["accessible_subnets"]:
+                state["accessible_subnets"].append(s)
+        return {**state, "current_phase": "pivot"}
+
     # Priority 4: Check stall condition
     findings_len = len(state["findings"])
     if state.get("last_findings_len") == findings_len:
@@ -1583,3 +1608,322 @@ def _dedup(new_findings: List[str], existing: List[str]) -> List[str]:
             seen.add(f)
             result.append(f)
     return result[-500:]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# POST-EXPLOITATION & PIVOT NODES (v5)
+# ═══════════════════════════════════════════════════════════════════════
+
+try:
+    import transport as _transport_mod
+    _HAS_TRANSPORT = True
+except ImportError:
+    _HAS_TRANSPORT = False
+
+try:
+    import tools.post_exploit as pe
+    _HAS_POST_EXPLOIT = True
+except ImportError:
+    _HAS_POST_EXPLOIT = False
+
+
+def post_exploit_node(state: ReconState) -> ReconState:
+    """Run local enumeration on a compromised host via the transport layer.
+
+    This node executes when a session exists on a compromised host. It:
+    1. Creates a transport from the session config
+    2. Enumerates local network interfaces, routes, ARP cache
+    3. Discovers internal subnets visible from this position
+    4. Enumerates system info (users, groups, services, cron jobs)
+    5. Searches for credentials left on the system
+    6. Identifies privilege escalation vectors
+    7. Does a quick ping sweep of newly discovered subnets
+    """
+    target_ip = state.get("current_target", "")
+    print("\n" + "=" * 60)
+    print(f"  PHASE: POST-EXPLOIT — {target_ip}")
+    print("=" * 60)
+
+    if not _HAS_POST_EXPLOIT:
+        print("  [!] post_exploit module not available")
+        state["compromised_hosts"][target_ip]["enumerated"] = True
+        return {**state, "current_phase": "scope"}
+
+    # Find the session for this host
+    sessions = state.get("sessions", [])
+    target_sessions = [s for s in sessions if s.get("host_ip") == target_ip]
+    if not target_sessions:
+        print(f"  [!] No active session for {target_ip}")
+        return {**state, "current_phase": "scope"}
+
+    session = target_sessions[0]
+    transport_type = session.get("transport_type", "local")
+
+    # Create the transport
+    transport = None
+    if _HAS_TRANSPORT:
+        try:
+            mgr = _transport_mod.TransportManager()
+            transport = mgr.create_from_session(session)
+        except Exception as e:
+            print(f"  [!] Failed to create transport: {e}")
+
+    if not transport:
+        print(f"  [!] No transport available, using local (fallback)")
+        transport = _transport_mod.LocalTransport() if _HAS_TRANSPORT else None
+
+    new_findings = []
+
+    if transport:
+        # 1. Local network discovery
+        print("  [>] Enumerating local network interfaces...")
+        try:
+            net_info = pe.enum_local_network(transport)
+            interfaces = net_info.get("interfaces", [])
+            routes = net_info.get("routes", [])
+            arp = net_info.get("arp_cache", [])
+
+            for iface in interfaces:
+                new_findings.append(
+                    f"[POST-ENUM] {target_ip} interface {iface.get('name','?')}: "
+                    f"{iface.get('ip','?')} ({iface.get('mac','?')})"
+                )
+            for entry in arp[:10]:
+                new_findings.append(
+                    f"[POST-ENUM] {target_ip} ARP: {entry.get('ip','?')} "
+                    f"({entry.get('mac','?')})"
+                )
+
+            # Store in compromised host record
+            ch = state["compromised_hosts"].get(target_ip, {})
+            ch["interfaces"] = interfaces
+            ch["os_info"] = {**ch.get("os_info", {}), "routes": routes}
+            state["compromised_hosts"][target_ip] = ch
+
+        except Exception as e:
+            print(f"  [!] Network enum failed: {e}")
+
+        # 2. Discover internal networks
+        print("  [>] Discovering internal networks...")
+        try:
+            internal_subnets = pe.discover_internal_networks(transport)
+            ch = state["compromised_hosts"].get(target_ip, {})
+            ch["discovered_subnets"] = internal_subnets
+            state["compromised_hosts"][target_ip] = ch
+
+            for subnet in internal_subnets:
+                new_findings.append(f"[POST-ENUM] {target_ip} can reach subnet: {subnet}")
+                # Add to accessible networks for scope_node to discover
+                if subnet not in state["accessible_subnets"]:
+                    state["accessible_subnets"].append(subnet)
+                    print(f"  [+] New accessible subnet discovered: {subnet}")
+
+            # Update session
+            session["discovered_subnets"] = internal_subnets
+
+        except Exception as e:
+            print(f"  [!] Internal network discovery failed: {e}")
+
+        # 3. System info
+        print("  [>] Enumerating system info...")
+        try:
+            sysinfo = pe.enum_system_info(transport)
+            ch = state["compromised_hosts"].get(target_ip, {})
+            ch["os_info"] = {**ch.get("os_info", {}), **sysinfo}
+            ch["local_users"] = sysinfo.get("users", [])
+            state["compromised_hosts"][target_ip] = ch
+
+            new_findings.append(
+                f"[POST-ENUM] {target_ip}: {sysinfo.get('hostname','?')} "
+                f"({sysinfo.get('os','?')}) user={sysinfo.get('current_user','?')}"
+            )
+            if sysinfo.get("users"):
+                new_findings.append(
+                    f"[POST-ENUM] {target_ip} users: {', '.join(sysinfo['users'][:15])}"
+                )
+        except Exception as e:
+            print(f"  [!] System enum failed: {e}")
+
+        # 4. Credential discovery
+        print("  [>] Searching for credentials...")
+        try:
+            cred_files = pe.enum_credentials(transport)
+            ch = state["compromised_hosts"].get(target_ip, {})
+            ch["files_of_interest"] = cred_files
+            state["compromised_hosts"][target_ip] = ch
+
+            cred_ids = []
+            for cf in cred_files:
+                cred_id = f"cred_{target_ip}_{len(state.get('all_credentials', []))}"
+                state["all_credentials"].append({
+                    "id": cred_id,
+                    "username": "",
+                    "password": None,
+                    "hash": None,
+                    "hash_type": None,
+                    "key_path": None,
+                    "source": cf.get("type", "file"),
+                    "source_host": target_ip,
+                    "validated": False,
+                    "validated_against": None,
+                    "notes": cf.get("path", ""),
+                })
+                cred_ids.append(cred_id)
+                new_findings.append(
+                    f"[POST-ENUM] {target_ip} cred file: "
+                    f"{cf.get('type','?')} at {cf.get('path','?')}"
+                )
+            ch["credentials_found"] = cred_ids
+
+        except Exception as e:
+            print(f"  [!] Credential search failed: {e}")
+
+        # 5. Privilege escalation vectors
+        print("  [>] Identifying privilege escalation vectors...")
+        try:
+            privesc = pe.enum_privesc(transport)
+            ch = state["compromised_hosts"].get(target_ip, {})
+
+            # Convert to AttackVectors
+            sysinfo = ch.get("os_info", {})
+            privesc_vectors = pe.generate_privesc_vectors(privesc, sysinfo)
+            ch["privesc_vectors"] = privesc_vectors
+            state["compromised_hosts"][target_ip] = ch
+
+            # Add high-severity privesc to findings
+            for pv in privesc:
+                sev = pv.get("severity", "info")
+                if sev in ("high", "critical"):
+                    new_findings.append(
+                        f"[PRIVESC] {target_ip}: {pv.get('detail','?')} ({sev})"
+                    )
+
+            # Add vectors to global list
+            if privesc_vectors:
+                state["attack_vectors"] = state.get("attack_vectors", []) + privesc_vectors
+
+        except Exception as e:
+            print(f"  [!] Privesc enum failed: {e}")
+
+        # 6. Local services
+        print("  [>] Enumerating local services...")
+        try:
+            local_svcs = pe.enum_services_local(transport)
+            ch = state["compromised_hosts"].get(target_ip, {})
+            ch["local_services"] = local_svcs
+            state["compromised_hosts"][target_ip] = ch
+
+            for svc in local_svcs[:10]:
+                if svc.get("port") and svc.get("port") not in state["hosts"].get(target_ip, {}).get("services", {}):
+                    new_findings.append(
+                        f"[POST-ENUM] {target_ip} local service: "
+                        f"{svc.get('port','?')}/{svc.get('protocol','?')} "
+                        f"({svc.get('process','?')})"
+                    )
+        except Exception as e:
+            print(f"  [!] Service enum failed: {e}")
+
+        transport.close()
+
+    # Mark as enumerated
+    if target_ip in state.get("compromised_hosts", {}):
+        state["compromised_hosts"][target_ip]["enumerated"] = True
+
+    # Merge findings
+    state["findings"] = _dedup(new_findings, state["findings"])
+
+    print(f"\n  [+] Post-exploit complete: {len(new_findings)} new findings")
+    return {**state, "current_phase": "scope"}
+
+
+def pivot_node(state: ReconState) -> ReconState:
+    """Discover and enumerate hosts in newly discovered internal networks.
+
+    This node runs after post_exploit discovers internal subnets. It:
+    1. Identifies subnets that are accessible but not yet scanned
+    2. Creates a SOCKS transport or uses existing sessions to reach them
+    3. Runs ping sweeps through the pivot to find alive hosts
+    4. Adds discovered hosts to the hosts dict for normal enumeration
+    """
+    print("\n" + "=" * 60)
+    print(f"  PHASE: PIVOT — Discover internal networks")
+    print("=" * 60)
+
+    # Find unscanned subnets that were discovered from compromised hosts
+    scanned = state.get("scanned_subnets", [])
+    compromised = state.get("compromised_hosts", {})
+
+    pivot_targets = []
+    for ip, ch in compromised.items():
+        if ch.get("enumerated"):
+            for subnet in ch.get("discovered_subnets", []):
+                if subnet not in scanned and subnet not in pivot_targets:
+                    pivot_targets.append((subnet, ip))
+
+    if not pivot_targets:
+        print("  [*] No new internal networks to pivot to.")
+        return {**state, "current_phase": "report"}
+
+    new_findings = []
+
+    for subnet, via_host in pivot_targets:
+        print(f"\n  [>] Pivoting to {subnet} via {via_host}...")
+
+        # Find a session for the pivot host
+        sessions = state.get("sessions", [])
+        pivot_sessions = [s for s in sessions if s.get("host_ip") == via_host]
+        if not pivot_sessions:
+            print(f"  [!] No session on {via_host} for pivot")
+            continue
+
+        session = pivot_sessions[0]
+
+        # Create transport and run ping sweep through it
+        if _HAS_TRANSPORT and _HAS_POST_EXPLOIT:
+            try:
+                mgr = _transport_mod.TransportManager()
+                transport = mgr.create_from_session(session)
+
+                print(f"  [>] Ping sweeping {subnet} via {via_host}...")
+                alive_hosts = pe.enum_pivot_targets(transport, [subnet])
+                transport.close()
+
+                for alive_ip in alive_hosts:
+                    new_findings.append(
+                        f"[PIVOT] {alive_ip} discovered via {via_host} (subnet {subnet})"
+                    )
+
+                    # Add topology edge
+                    state["topology_edges"].append({
+                        "from_host": via_host,
+                        "to_host": alive_ip,
+                        "edge_type": "discovered",
+                        "transport": "pivot",
+                        "session_id": session.get("id", ""),
+                        "notes": f"Discovered during pivot to {subnet}",
+                    })
+
+                    # Add to hosts dict if not present
+                    if alive_ip not in state["hosts"]:
+                        state["hosts"][alive_ip] = NetworkHost(
+                            ip=alive_ip, hostname=None, os="unknown",
+                            os_version="", domain=None, services={},
+                            web_apps=[], ad_info=None, findings=[],
+                            attack_vectors=[], enumerated=False,
+                            notes=f"Discovered via pivot from {via_host}",
+                        )
+                        print(f"  [+] New host: {alive_ip}")
+
+                # Mark subnet as scanned
+                if subnet not in scanned:
+                    scanned.append(subnet)
+                state["scanned_subnets"] = scanned
+
+            except Exception as e:
+                print(f"  [!] Pivot to {subnet} failed: {e}")
+
+    state["findings"] = _dedup(new_findings, state["findings"])
+    state["pivot_depth"] = state.get("pivot_depth", 0) + 1
+
+    print(f"\n  [+] Pivot complete: {len(new_findings)} new findings")
+    return {**state, "current_phase": "scope"}

@@ -31,14 +31,23 @@ from nodes import (
     scope_node, discover_node, enumerate_node,
     analyze_node, report_node,
 )
+try:
+    from nodes import post_exploit_node, pivot_node
+    _HAS_POST_EXPLOIT = True
+except ImportError:
+    _HAS_POST_EXPLOIT = False
 
 
 def build_graph():
     """
-    Build the cyclic enumeration graph.
+    Build the cyclic enumeration graph with post-exploitation support.
 
-    scope (hub) → discover → enumerate → analyze → report
+    scope (hub) → discover → enumerate → analyze → [post_exploit → pivot] → report
     All action nodes return to scope for next routing decision.
+
+    When compromised hosts exist, scope routes to post_exploit which runs
+    local enumeration on the compromised host via the transport layer.
+    Pivot node discovers new internal networks and adds them to scope.
     """
     workflow = StateGraph(ReconState)
 
@@ -48,6 +57,10 @@ def build_graph():
     workflow.add_node("analyze", analyze_node)
     workflow.add_node("report", report_node)
 
+    if _HAS_POST_EXPLOIT:
+        workflow.add_node("post_exploit", post_exploit_node)
+        workflow.add_node("pivot", pivot_node)
+
     workflow.set_entry_point("scope")
 
     def route_from_scope(state: ReconState) -> str:
@@ -56,6 +69,8 @@ def build_graph():
             "discover": "discover",
             "enumerate": "enumerate",
             "analyze": "analyze",
+            "post_exploit": "post_exploit" if _HAS_POST_EXPLOIT else "report",
+            "pivot": "pivot" if _HAS_POST_EXPLOIT else "report",
             "report": "report",
             "complete": END,
         }
@@ -68,11 +83,18 @@ def build_graph():
         "report": "report",
         END: END,
     }
+    if _HAS_POST_EXPLOIT:
+        routes["post_exploit"] = "post_exploit"
+        routes["pivot"] = "pivot"
 
     workflow.add_conditional_edges("scope", route_from_scope, routes)
 
     for node in ["discover", "enumerate", "analyze"]:
         workflow.add_edge(node, "scope")
+
+    if _HAS_POST_EXPLOIT:
+        workflow.add_edge("post_exploit", "scope")
+        workflow.add_edge("pivot", "scope")
 
     workflow.add_edge("report", END)
 
@@ -197,6 +219,15 @@ Examples:
         "--cve-research", action="store_true", default=True,
         help="Search NVD/searchsploit for version-specific CVEs after enumeration (default: on)",
     )
+    parser.add_argument(
+        "--session-file", metavar="SESSION_JSON",
+        help="Load session config (compromised hosts, transports, credentials) from JSON file. "
+             "Enables post-exploitation enumeration from compromised positions.",
+    )
+    parser.add_argument(
+        "--post-exploit", action="store_true",
+        help="Run post-exploitation enumeration on compromised hosts (requires --session-file or existing sessions)",
+    )
     args = parser.parse_args()
 
     print("=" * 60)
@@ -254,6 +285,78 @@ Examples:
         state["test_creds"] = args.test_creds
         state["cve_research"] = args.cve_research
         state["quick_mode"] = args.quick
+
+        # Load session file for post-exploitation (v5)
+        if args.session_file:
+            import json as _json
+            print(f"\n[SESSION] Loading session config from {args.session_file}")
+            try:
+                with open(os.path.expanduser(args.session_file)) as f:
+                    session_data = _json.load(f)
+
+                # Load compromised hosts as sessions
+                for sess in session_data.get("sessions", []):
+                    state["sessions"].append(sess)
+                    # Add topology edge: VPN → compromised host
+                    state["topology_edges"].append({
+                        "from_host": state["listener_ip"],
+                        "to_host": sess["host_ip"],
+                        "edge_type": "direct",
+                        "transport": sess["transport_type"],
+                        "session_id": sess["id"],
+                        "notes": "Loaded from session file",
+                    })
+                    # Mark the host as having post-exploit potential
+                    if sess["host_ip"] not in state["compromised_hosts"]:
+                        state["compromised_hosts"][sess["host_ip"]] = {
+                            "ip": sess["host_ip"],
+                            "hostname": None,
+                            "sessions": [sess["id"]],
+                            "local_users": [],
+                            "local_services": [],
+                            "interfaces": sess.get("interfaces", []),
+                            "discovered_subnets": sess.get("discovered_subnets", []),
+                            "credentials_found": [],
+                            "privesc_vectors": [],
+                            "files_of_interest": [],
+                            "os_info": {},
+                            "enumerated": False,
+                            "notes": f"Loaded via {sess['transport_type']} session",
+                        }
+
+                # Load pre-discovered credentials
+                for cred in session_data.get("credentials", []):
+                    state["all_credentials"].append(cred)
+
+                # Add discovered internal subnets to accessible networks
+                for sess in state["sessions"]:
+                    for subnet in sess.get("discovered_subnets", []):
+                        if subnet not in state["accessible_subnets"]:
+                            state["accessible_subnets"].append(subnet)
+                            print(f"  [+] Added accessible subnet: {subnet}")
+
+                # Add discovered internal subnets from compromised hosts
+                for ip, ch in state["compromised_hosts"].items():
+                    for subnet in ch.get("discovered_subnets", []):
+                        if subnet not in state["accessible_subnets"]:
+                            state["accessible_subnets"].append(subnet)
+
+                print(f"  [+] Loaded {len(state['sessions'])} session(s)")
+                print(f"  [+] Loaded {len(state['compromised_hosts'])} compromised host(s)")
+                print(f"  [+] Loaded {len(state['all_credentials'])} credential(s)")
+
+                state["session_file"] = args.session_file
+
+            except Exception as e:
+                print(f"  [!] Failed to load session file: {e}")
+
+        if args.post_exploit:
+            if not state.get("sessions"):
+                print("\n[!] --post-exploit requires sessions. Use --session-file to provide them.")
+                sys.exit(1)
+            # Set phase to start with post-exploitation
+            state["current_phase"] = "post_exploit"
+            print(f"\n[POST-EXPLOIT] Will enumerate {len(state['sessions'])} compromised host(s)")
 
         # If --targets specified, pre-seed them
         if args.targets:

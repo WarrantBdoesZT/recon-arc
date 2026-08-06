@@ -1,9 +1,10 @@
 """
 ReconARC — State Models
 =======================
-Core data structures for enumeration-only engagements.
-Tracks hosts, services, attack vectors, and findings.
-NO exploitation state — this agent only observes and recommends.
+Core data structures for enumeration engagements.
+Tracks hosts, services, attack vectors, findings, and active sessions.
+Supports post-exploitation: compromised hosts, credentials, transport sessions,
+and network topology graph for pivot operations.
 """
 
 import json
@@ -87,6 +88,63 @@ class NetworkHost(TypedDict):
     notes: str
 
 
+# ── Post-Exploitation Types ────────────────────────────────────────────
+
+class Credential(TypedDict):
+    id: str
+    username: str
+    password: Optional[str]          # plaintext password (if found)
+    hash: Optional[str]              # NTLM, shadow hash, etc.
+    hash_type: Optional[str]         # ntlm, sha512, bcrypt, etc.
+    key_path: Optional[str]          # SSH key file path
+    source: str                      # where found: config_file, bash_history, etc.
+    source_host: str                 # host IP where cred was found
+    validated: bool                  # has this cred been tested and confirmed?
+    validated_against: Optional[str] # service where cred was confirmed valid
+    notes: str
+
+
+class Session(TypedDict):
+    """An active access session on a compromised host."""
+    id: str                          # unique session ID
+    host_ip: str                     # compromised host IP
+    transport_type: str              # local, ssh, webshell, socks, proxychain
+    transport_config: dict           # transport-specific config (host, port, user, etc.)
+    username: Optional[str]          # user context (www-data, root, etc.)
+    privilege: str                   # user, root, system, administrator
+    established_at: str              # ISO timestamp
+    interfaces: List[dict]           # network interfaces on the host
+    discovered_subnets: List[str]    # internal subnets visible from this host
+    notes: str
+
+
+class NetworkEdge(TypedDict):
+    """Edge in the topology graph — how two hosts connect."""
+    from_host: str                   # source IP
+    to_host: str                     # destination IP
+    edge_type: str                   # direct, pivot, discovered, dns_resolved
+    transport: str                   # vpn, ssh_tunnel, socks_proxy, webshell
+    session_id: Optional[str]        # session enabling this edge
+    notes: str
+
+
+class CompromisedHost(TypedDict):
+    """Tracks a compromised host and what we know from inside it."""
+    ip: str
+    hostname: Optional[str]
+    sessions: List[str]              # session IDs active on this host
+    local_users: List[str]           # users discovered
+    local_services: List[dict]       # services running on the host
+    interfaces: List[dict]           # network interfaces
+    discovered_subnets: List[str]    # internal networks visible
+    credentials_found: List[str]     # credential IDs found on this host
+    privesc_vectors: List[AttackVector]  # local privesc opportunities
+    files_of_interest: List[dict]    # interesting files found
+    os_info: dict                    # full system info
+    enumerated: bool                 # has post-exploit enum been run?
+    notes: str
+
+
 class ReconState(TypedDict):
     # Network topology
     hosts: Annotated[Dict[str, NetworkHost], lambda a, b: {**a, **b}]
@@ -108,7 +166,7 @@ class ReconState(TypedDict):
 
     # Current operating context
     current_target: str
-    current_phase: str           # discover, enumerate, analyze, report
+    current_phase: str           # discover, enumerate, analyze, post_exploit, pivot, report
     current_position: str
 
     # LLM context accumulation
@@ -140,6 +198,15 @@ class ReconState(TypedDict):
     # Internal tracking (not persisted)
     _cve_research_done: bool
     _cred_test_done: bool
+
+    # Post-exploitation state (v5)
+    sessions: Annotated[List[Session], lambda a, b: (a + b)[-50:]]  # active access sessions
+    compromised_hosts: Annotated[Dict[str, CompromisedHost], lambda a, b: {**a, **b}]
+    topology_edges: Annotated[List[NetworkEdge], lambda a, b: (a + b)[-200:]]
+    all_credentials: Annotated[List[Credential], lambda a, b: (a + b)[-200:]]  # structured creds
+    active_transport: str        # name of the active transport (for routing commands)
+    pivot_depth: int             # how many hops from the VPN entry point
+    session_file: str            # path to session config file for loading transports
 
     # Session
     session_id: str
@@ -193,6 +260,13 @@ def initial_state(
         cve_research=True,
         _cve_research_done=False,
         _cred_test_done=False,
+        sessions=[],
+        compromised_hosts={},
+        topology_edges=[],
+        all_credentials=[],
+        active_transport="local",
+        pivot_depth=0,
+        session_file="",
         session_id=session_id,
         save_path=f"~/projects/recon-arc/saves/{session_id}.json",
     )
@@ -310,5 +384,34 @@ def get_engagement_summary(state: ReconState) -> str:
 
     lines.append(f"\nAccessible networks: {', '.join(state['accessible_subnets'])}")
     lines.append(f"Iteration: {state['iteration']}/{state['max_iterations']}")
+
+    # Post-exploitation state
+    sessions = state.get("sessions", [])
+    if sessions:
+        lines.append(f"\nActive Sessions: {len(sessions)}")
+        for s in sessions:
+            lines.append(
+                f"  {s['id']}: {s['host_ip']} ({s['transport_type']}/{s.get('privilege','?')}) "
+                f"subnets: {', '.join(s.get('discovered_subnets', []))}"
+            )
+
+    compromised = state.get("compromised_hosts", {})
+    if compromised:
+        lines.append(f"\nCompromised Hosts: {len(compromised)}")
+        for ip, ch in compromised.items():
+            cred_count = len(ch.get("credentials_found", []))
+            pe = "✓" if ch.get("enumerated") else "✗"
+            lines.append(f"  {ip} [post-enum:{pe}] creds:{cred_count}")
+
+    edges = state.get("topology_edges", [])
+    if edges:
+        lines.append(f"\nTopology: {len(edges)} edges")
+        for e in edges[:5]:
+            lines.append(f"  {e['from_host']} → {e['to_host']} ({e['edge_type']}/{e['transport']})")
+
+    all_creds = state.get("all_credentials", [])
+    if all_creds:
+        validated = [c for c in all_creds if c.get("validated")]
+        lines.append(f"\nCredentials: {len(all_creds)} total ({len(validated)} validated)")
 
     return "\n".join(lines)
