@@ -926,8 +926,15 @@ def attempt_lateral(
     }
 
     # ── Determine candidate techniques from services ──
-    open_ports = {p for p, s in known_services.items()
-                  if s.get("state", "open") == "open" or "state" not in s}
+    # known_services can be {port: "service_name"} or {port: {"state": "open", "name": "..."}}
+    open_ports = set()
+    for p, s in known_services.items():
+        if isinstance(s, dict):
+            if s.get("state", "open") == "open" or "state" not in s:
+                open_ports.add(p)
+        else:
+            # Service name as string — assume open
+            open_ports.add(p)
     # Be lenient: if caller passed services without explicit state, treat as open.
 
     techniques: List[str] = []
