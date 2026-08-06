@@ -442,7 +442,7 @@ def get_engagement_summary(state: ReconState) -> str:
         lines.append(f"\nAttack Vectors: {len(all_vecs)} total")
         by_cat = {}
         for v in all_vecs:
-            by_cat.setdefault(v["category"], []).append(v)
+            by_cat.setdefault(v.get("category", "uncategorized"), []).append(v)
         for cat, vecs in sorted(by_cat.items()):
             high = sum(1 for v in vecs if v["confidence"] == "high")
             lines.append(f"  {cat}: {len(vecs)} ({high} high-confidence)")

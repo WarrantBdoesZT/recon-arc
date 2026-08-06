@@ -631,6 +631,7 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
                                 "title": f"WordPress DB credentials — potential SSH/WP reuse",
                                 "description": cred_info,
                                 "target": f"{target}:{port}",
+                                "category": "initial_access",
                                 "vector_type": "default_creds",
                                 "confidence": "high",
                                 "score": 85,
