@@ -1,5 +1,5 @@
 """
-ReconARC — Active Directory Enumeration
+StrikeARC — Active Directory Enumeration
 ========================================
 AD discovery via LDAP, RPC, and SMB — all unauthenticated/null-session.
 NO exploitation (no Kerberoasting, no AS-REP roasting, no DCSync).

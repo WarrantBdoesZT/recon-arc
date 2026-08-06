@@ -1,5 +1,5 @@
 """
-SNMP enumeration module for ReconARC.
+SNMP enumeration module for StrikeARC.
 
 Provides passive SNMP enumeration functions to extract system information,
 processes, installed software, network interfaces, and users from targets

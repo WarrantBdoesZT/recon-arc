@@ -1,5 +1,5 @@
 """
-ReconARC — CVE Research Module
+StrikeARC — CVE Research Module
 ==============================
 Online CVE lookup (NVD REST API) and exploit-db wrapper for version-specific
 vulnerability research. Also provides concrete exploit-command generation for

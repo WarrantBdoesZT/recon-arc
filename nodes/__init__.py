@@ -1,5 +1,5 @@
 """
-ReconARC — Graph Nodes
+StrikeARC — Graph Nodes
 ======================
 LangGraph nodes for the enumeration pipeline:
   scope → discover → enumerate → analyze → report
@@ -1756,7 +1756,7 @@ def _generate_heuristic_report(state: ReconState, summary: str,
                                  vectors: List[AttackVector]) -> str:
     """Generate report without LLM (fallback)."""
     lines = [
-        "# ReconARC Enumeration Report",
+        "# StrikeARC Enumeration Report",
         f"\n**Session:** {state.get('session_id', 'unknown')}",
         f"**Iterations:** {state.get('iteration', 0)}/{state.get('max_iterations', 0)}",
         f"**Subnet:** {state.get('initial_subnet', 'N/A')}",

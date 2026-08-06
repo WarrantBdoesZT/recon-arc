@@ -1,5 +1,5 @@
 """
-ReconARC — Active SQL Injection Detection
+StrikeARC — Active SQL Injection Detection
 ==========================================
 Sends actual SQLi payloads to parameters and compares responses against a
 clean baseline to confirm injection (the existing ``check_sqli_point`` in

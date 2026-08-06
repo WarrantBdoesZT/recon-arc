@@ -1,5 +1,5 @@
 """
-ReconARC — State Models
+StrikeARC — State Models
 =======================
 Core data structures for enumeration engagements.
 Tracks hosts, services, attack vectors, findings, and active sessions.
@@ -145,6 +145,67 @@ class CompromisedHost(TypedDict):
     notes: str
 
 
+# ── Offensive Operations Types (v7) ───────────────────────────────────
+
+class FlagEntry(TypedDict):
+    """A captured flag on a host."""
+    host_ip: str
+    flag_type: str                   # user, root, service, custom
+    flag_value: str                  # the flag content
+    path: str                        # where it was found
+    captured_at: str                 # ISO timestamp
+    method: str                      # how it was obtained
+
+
+class ExploitAttempt(TypedDict):
+    """Record of an exploitation attempt."""
+    id: str
+    target: str                      # host:port or URL
+    vector_id: str                   # the attack vector that was exploited
+    technique: str                   # sqli_dump, rce, file_upload, webshell, etc.
+    command: str                     # what was executed
+    success: bool
+    result: str                      # output or error
+    timestamp: str
+    session_id: Optional[str]        # session created if successful
+
+
+class Tunnel(TypedDict):
+    """An active network tunnel for pivoting."""
+    id: str
+    tunnel_type: str                 # chisel, ligolo, ssh_forward, socks
+    local_port: int
+    remote_host: str                 # target reachable through tunnel
+    remote_port: int
+    via_host: str                    # pivot host
+    pid: Optional[int]               # process ID
+    established_at: str
+    status: str                      # active, dead, error
+
+
+class PrivescResult(TypedDict):
+    """Result of privilege escalation attempt on a host."""
+    host_ip: str
+    current_user: str
+    technique: str                   # sudo, suid, cron, kernel, cap, path
+    success: bool
+    new_user: Optional[str]          # user escalated to (root, etc.)
+    evidence: str
+    timestamp: str
+
+
+class LateralAttempt(TypedDict):
+    """Record of lateral movement attempt."""
+    id: str
+    from_host: str
+    to_host: str
+    credential_id: str
+    technique: str                   # smb, wmi, ssh, winrm, psexec
+    success: bool
+    session_id: Optional[str]
+    timestamp: str
+
+
 class ReconState(TypedDict):
     # Network topology
     hosts: Annotated[Dict[str, NetworkHost], lambda a, b: {**a, **b}]
@@ -208,6 +269,16 @@ class ReconState(TypedDict):
     pivot_depth: int             # how many hops from the VPN entry point
     session_file: str            # path to session config file for loading transports
 
+    # Offensive operations state (v7)
+    flags_captured: Annotated[List[FlagEntry], lambda a, b: (a + b)[-50:]]
+    exploit_attempts: Annotated[List[ExploitAttempt], lambda a, b: (a + b)[-200:]]
+    active_tunnels: Annotated[List[Tunnel], lambda a, b: (a + b)[-20:]]
+    privesc_results: Annotated[Dict[str, PrivescResult], lambda a, b: {**a, **b}]
+    lateral_attempts: Annotated[List[LateralAttempt], lambda a, b: (a + b)[-100:]]
+    kill_chain_phase: str        # recon, exploit, privesc, lateral, pivot, flag_hunt
+    exploit_threshold: int       # minimum score to auto-exploit (default 70)
+    flags_found_count: int       # running total
+
     # Session
     session_id: str
     save_path: str
@@ -267,6 +338,14 @@ def initial_state(
         active_transport="local",
         pivot_depth=0,
         session_file="",
+        flags_captured=[],
+        exploit_attempts=[],
+        active_tunnels=[],
+        privesc_results={},
+        lateral_attempts=[],
+        kill_chain_phase="recon",
+        exploit_threshold=70,
+        flags_found_count=0,
         session_id=session_id,
         save_path=f"~/projects/recon-arc/saves/{session_id}.json",
     )

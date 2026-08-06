@@ -1,5 +1,5 @@
 """
-ReconARC — Active LFI / Path Traversal Detection
+StrikeARC — Active LFI / Path Traversal Detection
 =================================================
 Sends actual path-traversal and Local File Inclusion (LFI) payloads to URL
 parameters and form fields, then analyses the responses for indicators of

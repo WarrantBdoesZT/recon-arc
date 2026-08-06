@@ -2,7 +2,7 @@
 """
 extra_enum.py — Miscellaneous enumeration modules (NFS, SMTP, Database, CMS).
 
-Part of the ReconARC enumeration agent. Passive enumeration only — no exploits.
+Part of the StrikeARC enumeration agent. Passive enumeration only — no exploits.
 All functions handle failures gracefully and return structured data.
 """
 

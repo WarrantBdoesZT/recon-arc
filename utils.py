@@ -1,7 +1,9 @@
 """
-ReconARC — Utilities
+StrikeARC — Utilities
 =====================
-Command execution (safe, no exploitation), network helpers, parsers.
+Command execution, network helpers, parsers.
+Full offensive operations — exploits, privesc, lateral movement, pivoting.
+Safety filter blocks ONLY truly destructive commands.
 """
 
 import json
@@ -20,43 +22,31 @@ requests.packages.urllib3.disable_warnings()
 
 
 # ── Safety ────────────────────────────────────────────────────────────
-# This is an enumeration-only tool. We block exploit execution commands.
+# StrikeARC is a full kill-chain automation tool for authorized HTB lab
+# environments. The safety filter blocks ONLY truly destructive commands
+# that could render a lab host unrecoverable or disrupt the lab infrastructure.
+# All offensive techniques (exploits, shells, credential attacks, etc.) are
+# permitted.
 
-DANGEROUS_PATTERNS = [
+DESTRUCTIVE_PATTERNS = [
     "rm -rf /", "rm -rf /*", "mkfs", "dd if=/dev/zero",
     "dd if=/dev/urandom", ":(){:|:&};:", "shutdown", "reboot",
     "chmod -R 777 /", "halt", "init 0", "init 6",
-]
-
-# Commands that constitute exploitation (not enumeration)
-EXPLOIT_PATTERNS = [
-    "nc -e", "nc -l", "bash -i", "sh -i", "/dev/tcp/",
-    "msfconsole", "msfvenom", "exploit/multi", "exploit/windows",
-    "reverse", "shell.elf", "shell.exe", "payload.exe",
-    "python -c 'import socket,*rm -rf",  # python reverse shells
-    "perl -e", "ruby -e",  # language reverse shells
-    "crackmapexec exec", "evil-winrm",  # exploitation tools
-    "psexec", "wmiexec", "smbexec", "atexec",  # remote execution
-    "sshpass",  # credential usage (not discovery)
-    "hashcat", "john ",  # password cracking
-    "mimikatz", "sekurlsa", "lsadump",  # credential extraction
-    "net user.*add", "net localgroup",  # account creation
-    "certutil.*decode", "certutil.*urlcache",  # file download
-    "powershell.*-enc", "powershell.*hidden",  # obfuscated execution
-    "wget http.*-O", "curl.*| bash", "curl.*| sh",  # download+execute
+    "fdisk", "parted", "wipefs", "badblocks",
+    "iptables -F", "iptables -X", "nft flush",  # wipe firewall rules
 ]
 
 
 def is_safe_command(cmd: str) -> bool:
-    """Check if a command is safe for an enumeration-only agent."""
+    """Check if a command avoids truly destructive operations.
+
+    StrikeARC permits exploitation commands. Only commands that could
+    permanently damage a lab host or its network configuration are blocked.
+    """
     cmd_lower = cmd.lower()
 
-    for pattern in DANGEROUS_PATTERNS:
+    for pattern in DESTRUCTIVE_PATTERNS:
         if pattern in cmd_lower:
-            return False
-
-    for pattern in EXPLOIT_PATTERNS:
-        if re.search(pattern, cmd_lower):
             return False
 
     return True
@@ -72,7 +62,7 @@ def run_command(cmd: str, timeout: int = 60) -> Dict:
     if not is_safe_command(cmd):
         return {
             "stdout": "",
-            "stderr": f"BLOCKED (exploitation command): {cmd}",
+            "stderr": f"BLOCKED (destructive command): {cmd}",
             "returncode": -1,
             "cmd": cmd,
         }

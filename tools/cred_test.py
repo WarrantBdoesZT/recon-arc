@@ -1,5 +1,5 @@
 """
-ReconARC — Default Credential Testing
+StrikeARC — Default Credential Testing
 ======================================
 SAFE testing of KNOWN default credentials against discovered services.
 
@@ -246,7 +246,7 @@ def test_form_login(
     }
 
     headers = {
-        'User-Agent': 'Mozilla/5.0 (ReconARC cred-test)',
+        'User-Agent': 'Mozilla/5.0 (StrikeARC cred-test)',
         'Content-Type': 'application/x-www-form-urlencoded',
     }
 
@@ -495,7 +495,7 @@ def test_splunk_login(
         'set_tz': 'UTC',
     }
     headers = {
-        'User-Agent': 'Mozilla/5.0 (ReconARC cred-test)',
+        'User-Agent': 'Mozilla/5.0 (StrikeARC cred-test)',
         'Content-Type': 'application/x-www-form-urlencoded',
     }
 

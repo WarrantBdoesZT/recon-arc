@@ -1,5 +1,5 @@
 """
-DNS Enumeration Module for ReconARC.
+DNS Enumeration Module for StrikeARC.
 
 Provides passive DNS enumeration capabilities:
   - Zone transfer (AXFR) attempts

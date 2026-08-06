@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ReconARC — Advanced Reconnaissance & Attack-path Ranking Console
+StrikeARC — Advanced Reconnaissance & Attack-path Ranking Console
 ==================================================================
 An LLM-powered enumeration agent for HTB labs and CTF environments.
 Scans web and internal networks, identifies attack vectors, and ranks
@@ -135,7 +135,7 @@ def init_tools():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ReconARC — Advanced Reconnaissance & Attack-path Ranking",
+        description="StrikeARC — Advanced Reconnaissance & Attack-path Ranking",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 IMPORTANT: Only use against networks you own or have explicit written permission to test.
@@ -231,7 +231,7 @@ Examples:
     args = parser.parse_args()
 
     print("=" * 60)
-    print("  ReconARC — Advanced Reconnaissance &")
+    print("  StrikeARC — Advanced Reconnaissance &")
     print("             Attack-path Ranking Console")
     print("=" * 60)
 

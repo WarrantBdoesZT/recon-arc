@@ -1,5 +1,5 @@
 """
-ReconARC — SSL Certificate Enumeration
+StrikeARC — SSL Certificate Enumeration
 =======================================
 Extract and analyze SSL/TLS certificates for hostnames, organizations,
 and security issues. Critical for cross-host correlation.

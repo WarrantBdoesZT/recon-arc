@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-caldav_enum.py — CalDAV / Radicale Enumeration Module for ReconARC.
+caldav_enum.py — CalDAV / Radicale Enumeration Module for StrikeARC.
 
 Enumerates CalDAV servers (with a focus on Radicale) using the WebDAV/CalDAV
 HTTP extensions: PROPFIND, OPTIONS, REPORT, and GET.
@@ -106,7 +106,7 @@ RADICALE_PATHS = [
     "/.well-known/carddav",
 ]
 
-_USER_AGENT = "Mozilla/5.0 (ReconARC caldav-enum)"
+_USER_AGENT = "Mozilla/5.0 (StrikeARC caldav-enum)"
 
 
 # ── Internal HTTP helpers ──────────────────────────────────────────────

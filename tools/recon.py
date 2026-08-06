@@ -1,5 +1,5 @@
 """
-ReconARC — Reconnaissance Tools
+StrikeARC — Reconnaissance Tools
 ================================
 Network discovery, port scanning, service enumeration.
 All functions are read-only (no exploitation).
@@ -32,9 +32,15 @@ def network_sweep(
 
 
 def quick_scan(ip: str) -> Tuple[Dict[int, dict], str, str]:
-    """Fast top-1000 port scan. Returns (services, os_hint, raw_output)."""
+    """Fast top-1000 port scan. Returns (services, os_hint, raw_output).
+
+    Uses -sT (TCP connect) so it works without root. Falls back to
+    default SYN scan if running as root.
+    """
+    import os as _os
+    scan_flag = "" if _os.geteuid() == 0 else "-sT"
     cmd = (
-        f"nmap {ip} --top-ports 1000 -sV --version-intensity 5 "
+        f"nmap {ip} -Pn --top-ports 1000 -sV {scan_flag} --version-intensity 5 "
         f"-T4 --open --min-rate 5000 -oN - 2>/dev/null"
     )
     result = run_command(cmd, timeout=120)
@@ -48,14 +54,16 @@ def port_scan(
     fast: bool = False,
 ) -> Tuple[Dict[int, dict], str, str]:
     """Full port scan with version detection."""
+    import os as _os
+    scan_flag = "" if _os.geteuid() == 0 else "-sT"
     if fast:
         cmd = (
-            f"nmap {target_ip} --top-ports 1000 -sV --version-intensity 5 "
+            f"nmap {target_ip} -Pn --top-ports 1000 -sV {scan_flag} --version-intensity 5 "
             f"-T4 --open --min-rate 5000 -oN - 2>/dev/null"
         )
     else:
         cmd = (
-            f"nmap {target_ip} -p- -sV -sC --version-intensity 5 "
+            f"nmap {target_ip} -Pn -p- -sV {scan_flag} -sC --version-intensity 5 "
             f"-T4 --open --min-rate 5000 -oN - 2>/dev/null"
         )
     result = run_command(cmd, timeout=300)

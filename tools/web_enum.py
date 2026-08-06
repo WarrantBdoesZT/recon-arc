@@ -1,5 +1,5 @@
 """
-ReconARC — Web Application Enumeration
+StrikeARC — Web Application Enumeration
 =======================================
 Directory busting, form/API discovery, fingerprinting, config file detection.
 NO exploitation — only passive and active enumeration.

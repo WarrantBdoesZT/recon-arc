@@ -1,5 +1,5 @@
 """
-ReconARC — Attack Chain Composition Engine
+StrikeARC — Attack Chain Composition Engine
 ==========================================
 Combines individual :class:`AttackVector` findings into multi-step kill
 chains.  A *chain* shows the operator HOW a series of independent findings

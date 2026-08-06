@@ -1,5 +1,5 @@
 """
-ReconARC — Vulnerability Scanner
+StrikeARC — Vulnerability Scanner
 =================================
 Maps discovered services to CVEs, ranks attack vectors, and generates
 exploit suggestions WITHOUT executing any exploit.

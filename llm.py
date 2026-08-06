@@ -1,5 +1,5 @@
 """
-ReconARC — LLM Provider Configuration
+StrikeARC — LLM Provider Configuration
 ======================================
 GLM-5.2 (Z.AI) with retry logic.
 Three-tier: planner (JSON, cheap) + analyst (medium) + report (max output).

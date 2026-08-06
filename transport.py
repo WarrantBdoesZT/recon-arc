@@ -1,5 +1,5 @@
 """
-ReconARC — Transport Abstraction Layer
+StrikeARC — Transport Abstraction Layer
 =======================================
 Routes command execution through different contexts: local subprocess, SSH,
 webshell, SOCKS proxy, or chained proxies. This is the key abstraction that
@@ -73,7 +73,7 @@ def _check_safe(cmd: str) -> Optional[Dict]:
     """
     if not is_safe_command(cmd):
         return _empty_result(
-            cmd, f"BLOCKED (exploitation command): {cmd}", returncode=-1
+            cmd, f"BLOCKED (destructive command): {cmd}", returncode=-1
         )
     return None
 
@@ -150,7 +150,7 @@ class BaseTransport:
 class LocalTransport(BaseTransport):
     """Execute commands on the local machine via ``utils.run_command()``.
 
-    This is the default transport and what ReconARC has used implicitly up
+    This is the default transport and what StrikeARC has used implicitly up
     to now. It is a drop-in wrapper: the output shape is identical.
     """
 
