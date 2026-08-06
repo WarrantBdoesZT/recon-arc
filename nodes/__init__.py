@@ -1834,6 +1834,16 @@ def report_node(state: ReconState) -> ReconState:
     print("  PHASE: ENGAGEMENT REPORT")
     print("=" * 60)
 
+    # Deduplicate flags_captured by flag_value
+    seen_flag_values = set()
+    unique_flags = []
+    for f in state.get("flags_captured", []):
+        val = f.get("flag_value", "")
+        if val not in seen_flag_values:
+            seen_flag_values.add(val)
+            unique_flags.append(f)
+    state["flags_captured"] = unique_flags
+
     summary = get_engagement_summary(state)
 
     # Collect all attack vectors — DEDUP by ID to prevent double counting
