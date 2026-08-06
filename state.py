@@ -259,6 +259,7 @@ class ReconState(TypedDict):
     # Internal tracking (not persisted)
     _cve_research_done: bool
     _cred_test_done: bool
+    _analysis_done: bool
 
     # Post-exploitation state (v5)
     sessions: Annotated[List[Session], lambda a, b: (a + b)[-50:]]  # active access sessions
@@ -331,6 +332,7 @@ def initial_state(
         cve_research=True,
         _cve_research_done=False,
         _cred_test_done=False,
+        _analysis_done=False,
         sessions=[],
         compromised_hosts={},
         topology_edges=[],

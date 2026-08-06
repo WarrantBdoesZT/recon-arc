@@ -525,6 +525,125 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
         if tech.get("title"):
             new_findings.append(f"[ENUM] {url}: title='{tech['title']}'")
 
+    # ── robots.txt scan (flags + hidden paths) ──────────────────────
+    try:
+        import requests as _req
+        robots_resp = _req.get(f"{url}/robots.txt", timeout=5, verify=False)
+        if robots_resp.status_code == 200 and robots_resp.text.strip():
+            robots_content = robots_resp.text
+            new_findings.append(f"[ENUM] {url}/robots.txt found ({len(robots_content)}b)")
+
+            # Search for flag patterns
+            import re as _re
+            flag_patterns = [r'DANTE\{[^}]+\}', r'FLAG\{[^}]+\}', r'HTB\{[^}]+\}', r'CTF\{[^}]+\}']
+            for pattern in flag_patterns:
+                flags_found = _re.findall(pattern, robots_content)
+                for flag in flags_found:
+                    new_findings.append(f"[FLAG] 🚩 {flag} (found in robots.txt)")
+                    state["flags_captured"] = state.get("flags_captured", []) + [{
+                        "host_ip": target,
+                        "flag_type": "robots",
+                        "flag_value": flag,
+                        "path": f"{url}/robots.txt",
+                        "captured_at": __import__("time").strftime("%Y-%m-%dT%H:%M:%S"),
+                        "method": "robots.txt scan",
+                    }]
+                    state["flags_found_count"] = state.get("flags_found_count", 0) + 1
+
+            # Extract Disallow paths for further enumeration
+            disallowed = _re.findall(r'(?:Disallow|Allow):\s*(.+)', robots_content)
+            for path in disallowed[:15]:
+                path = path.strip()
+                if path and path != '/':
+                    new_findings.append(f"  → robots.txt path: {path}")
+    except Exception:
+        pass
+
+    # ── WordPress/CMS detection ─────────────────────────────────────
+    wp_detected = False
+    wp_paths = [
+        f"{url}/wordpress/wp-login.php",
+        f"{url}/wp-login.php",
+        f"{url}/blog/wp-login.php",
+    ]
+    for wp_path in wp_paths:
+        try:
+            wp_resp = _req.get(wp_path, timeout=5, verify=False, allow_redirects=False)
+            if wp_resp.status_code == 200 and 'wp-login' in wp_resp.text.lower():
+                wp_base = wp_path.rsplit('/wp-login.php', 1)[0]
+                new_findings.append(f"[CMS] WordPress detected at {wp_base}")
+                wp_detected = True
+
+                # Extract WP version
+                wp_ver_match = _re.search(r'generator.*?v=([0-9.]+)', wp_resp.text)
+                if wp_ver_match:
+                    wp_ver = wp_ver_match.group(1)
+                    new_findings.append(f"[CMS] WordPress version: {wp_ver}")
+
+                # Check for wp-config.php backup (swp, bak, ~)
+                for ext in ['.swp', '.bak', '~', '.save', '.old']:
+                    cfg_resp = _req.get(f"{wp_base}/.wp-config.php{ext}", timeout=3, verify=False)
+                    if cfg_resp.status_code == 200 and len(cfg_resp.content) > 100:
+                        new_findings.append(
+                            f"[!] wp-config.php backup found: {wp_base}/.wp-config.php{ext} "
+                            f"({len(cfg_resp.content)}b) [CRITICAL]"
+                        )
+                        # Extract DB credentials
+                        cfg_text = cfg_resp.text if hasattr(cfg_resp, 'text') else cfg_resp.content.decode('utf-8', errors='replace')
+                        # Handle vim swap files (binary)
+                        import subprocess
+                        try:
+                            # Save and run strings on it
+                            tmp_path = f"/tmp/wp_cfg_backup_{port}{ext}"
+                            with open(tmp_path, 'wb') as f:
+                                f.write(cfg_resp.content)
+                            strings_result = subprocess.run(
+                                ['strings', tmp_path],
+                                capture_output=True, text=True, timeout=5
+                            )
+                            cfg_text = strings_result.stdout + cfg_text
+                        except Exception:
+                            pass
+
+                        db_user = _re.search(r"DB_USER['\"]*,\s*['\"]([^'\"]+)", cfg_text)
+                        db_pass = _re.search(r"DB_PASSWORD['\"]*,\s*['\"]([^'\"]+)", cfg_text)
+                        db_name = _re.search(r"DB_NAME['\"]*,\s*['\"]([^'\"]+)", cfg_text)
+                        if db_user or db_pass:
+                            cred_info = f"DB_USER={db_user.group(1) if db_user else '?'}, DB_PASSWORD={db_pass.group(1) if db_pass else '?'}"
+                            new_findings.append(f"[!] WordPress DB credentials: {cred_info} [CRITICAL]")
+
+                            # Add to state credentials
+                            state["all_credentials"] = state.get("all_credentials", []) + [{
+                                "username": db_user.group(1) if db_user else "",
+                                "password": db_pass.group(1) if db_pass else "",
+                                "service": "mysql",
+                                "source": f"wp-config.php backup ({wp_base})",
+                                "validated": False,
+                                "validated_against": "",
+                            }]
+
+                            # Create high-priority attack vector for cred reuse
+                            state["attack_vectors"] = state.get("attack_vectors", []) + [{
+                                "id": f"wp_db_creds_{target}_{port}",
+                                "title": f"WordPress DB credentials — potential SSH/WP reuse",
+                                "description": cred_info,
+                                "target": f"{target}:{port}",
+                                "vector_type": "default_creds",
+                                "confidence": "high",
+                                "score": 85,
+                                "evidence": [f"wp-config.php backup at {wp_base}/"],
+                                "exploit_suggestion": f"Try {db_user.group(1) if db_user else ''}:{db_pass.group(1) if db_pass else ''} on SSH, WP login, MySQL",
+                            }]
+
+                # Check for debug.log (info leak)
+                debug_resp = _req.get(f"{wp_base}/wp-content/debug.log", timeout=3, verify=False)
+                if debug_resp.status_code == 200 and len(debug_resp.text) > 10:
+                    new_findings.append(f"[!] WordPress debug.log exposed ({len(debug_resp.text)}b)")
+
+                break
+        except Exception:
+            pass
+
     # Directory bust
     print(f"  [>] Directory busting {url}...")
     dirs = web.directory_bust(url, wordlist=state.get("wordlist", ""))
@@ -1048,8 +1167,36 @@ def _enumerate_extra_services(state, host, target, new_findings):
             if ftp_info and ftp_info.get("anonymous"):
                 files = ftp_info.get("files", [])
                 new_findings.append(f"[ENUM] {target}:{port}: FTP anonymous access, {len(files)} files")
-                for f in files[:5]:
+                for f in files[:10]:
                     new_findings.append(f"  → {f}")
+
+                # Check downloaded file contents for flags/creds/intel
+                file_contents = ftp_info.get("file_contents", {})
+                for fname, content in file_contents.items():
+                    new_findings.append(f"[FTP] Contents of {fname}:")
+                    # Scan for flags
+                    import re as _re
+                    for pattern in [r'DANTE\{[^}]+\}', r'FLAG\{[^}]+\}', r'HTB\{[^}]+\}']:
+                        flags = _re.findall(pattern, content)
+                        for flag in flags:
+                            new_findings.append(f"[FLAG] 🚩 {flag} (from FTP: {fname})")
+                            state["flags_captured"] = state.get("flags_captured", []) + [{
+                                "host_ip": target,
+                                "flag_type": "ftp",
+                                "flag_value": flag,
+                                "path": f"ftp://{fname}",
+                                "captured_at": __import__("time").strftime("%Y-%m-%dT%H:%M:%S"),
+                                "method": "FTP file download",
+                            }]
+                            state["flags_found_count"] = state.get("flags_found_count", 0) + 1
+                    # Show content preview
+                    for line in content.split("\n")[:5]:
+                        if line.strip():
+                            new_findings.append(f"  {line.strip()[:120]}")
+                    # Scan for intel (passwords, users, hints)
+                    lower_content = content.lower()
+                    if any(kw in lower_content for kw in ["password", "credential", "lfi", "reset", "pending", "todo", "secret"]):
+                        new_findings.append(f"[!] Intel in {fname} — potential actionable info")
 
 
 def _run_cve_research_host(state, host, target, new_findings):
@@ -1541,6 +1688,25 @@ def scope_node(state: ReconState) -> ReconState:
             print(f"\n  → ACTION: Attack path analysis")
             state["_analysis_done"] = True
             return {**state, "current_phase": "analyze"}
+
+    # Priority 3.25: Exploit high-confidence attack vectors (StrikeARC)
+    threshold = state.get("exploit_threshold", 70)
+    attempted_ids = {a["vector_id"] for a in state.get("exploit_attempts", [])}
+    unexploited = [
+        v for v in state.get("attack_vectors", [])
+        if v.get("score", 0) >= threshold and v.get("id") not in attempted_ids
+    ]
+    if unexploited:
+        best = max(unexploited, key=lambda v: v.get("score", 0))
+        print(f"\n  → ACTION: Exploit {best.get('target', '?')} — {best.get('title', '?')} (score: {best.get('score', 0)})")
+        return {**state, "current_phase": "exploit"}
+
+    # Priority 3.3: Flag hunt on compromised hosts (StrikeARC)
+    session_hosts = {s["host_ip"] for s in state.get("sessions", [])}
+    checked_hosts = {f["host_ip"] for f in state.get("flags_captured", [])}
+    if session_hosts - checked_hosts:
+        print(f"\n  → ACTION: Flag hunt on compromised hosts")
+        return {**state, "current_phase": "flag_hunt"}
 
     # Priority 3.5: Post-exploitation on compromised hosts
     compromised = state.get("compromised_hosts", {})

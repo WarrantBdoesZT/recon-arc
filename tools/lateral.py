@@ -47,19 +47,49 @@ def _have(tool: str) -> bool:
 
 
 def _parse_smb_shares(output: str) -> List[str]:
-    """Extract share names from smbclient/crackmapexec listing output."""
+    """Extract share names from smbclient/crackmapexec listing output.
+
+    Handles both formats:
+
+    smbclient -L::
+        Sharename       Type      Comment
+        ---------       ----      -------
+        ADMIN$          Disk      Remote Admin
+        C$              Disk      Default share
+        IPC$            IPC       IPC Service
+
+    crackmapexec --shares::
+        SMB  10.0.0.1  445  HOSTNAME  ADMIN$   READ
+        SMB  10.0.0.1  445  HOSTNAME  C$       READ,WRITE
+    """
     shares: List[str] = []
     for line in output.splitlines():
         line = line.strip()
-        # smbclient -L table rows look like:  Disk      IPC$     IPC Service (IPC)
-        # crackmapexec lists shares inline as: SMB  host  IPC$  READ
-        m = re.match(r"^(?:Disk|IPC|Printer)\s+(\S+)", line)
-        if m:
-            shares.append(m.group(1))
+        if not line:
             continue
-        m = re.match(r"^\S+\s+\S+\s+(\S+)\s", line)
-        if m and m.group(1).endswith("$"):
-            shares.append(m.group(1))
+
+        # Skip header / separator lines
+        if line.startswith(("Sharename", "---------", "SMB")):
+            # cme lines start with "SMB" but carry share data — handle below
+            if not line.startswith("SMB"):
+                continue
+
+        tokens = line.split()
+
+        # ── crackmapexec format: SMB  host  port  netbios  SHARE  PERMS ──
+        if tokens and tokens[0] == "SMB" and len(tokens) >= 5:
+            # Share name is typically the 5th token (index 4)
+            share = tokens[4]
+            if share and share not in ("Status", "-----"):
+                shares.append(share)
+            continue
+
+        # ── smbclient format: SHARE  TYPE  Comment ──
+        # Match lines where the second token is Disk/IPC/Printer
+        if len(tokens) >= 2 and tokens[1] in ("Disk", "IPC", "Printer"):
+            shares.append(tokens[0])
+            continue
+
     # Dedup, drop empty
     seen = set()
     out = []

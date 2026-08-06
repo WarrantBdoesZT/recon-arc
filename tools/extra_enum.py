@@ -416,66 +416,153 @@ def check_ftp_content(target_ip: str, port: int = 21) -> dict:
     """
     Check for anonymous FTP access and list accessible files.
 
+    Uses raw socket FTP with active mode (PORT command) to handle servers
+    that advertise internal IPs in PASV mode (common in pivoting labs).
+
     Args:
         target_ip: Target host.
         port: FTP port (default 21).
 
     Returns:
         Dict with keys: 'anonymous' (bool), 'banner' (str), 'files' (list),
-        'raw' (str).
+        'raw' (str), 'file_contents' (dict of filename → content).
     """
     print(f"    [+] ENUM: FTP anonymous check on {target_ip}:{port}")
-    import ftplib
+    import socket as _sock
+    import re as _re
 
-    info: dict = {"anonymous": False, "banner": "", "files": [], "raw": ""}
+    info: dict = {
+        "anonymous": False, "banner": "", "files": [], "raw": "",
+        "file_contents": {},
+    }
+
+    def _ftp_cmd(cmd, collect_data=False, listener_ip="10.10.14.96"):
+        """Send FTP command over raw socket with active mode data connection."""
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        s.settimeout(8)
+        s.connect((target_ip, port))
+        s.recv(1024)  # banner
+        s.sendall(b"USER anonymous\r\n")
+        s.recv(1024)
+        s.sendall(b"PASS anonymous@\r\n")
+        auth = s.recv(1024)
+        if b"230" not in auth:
+            s.close()
+            return None, "AUTH FAILED"
+
+        if collect_data:
+            # Set up active mode listener
+            data_port = 55600
+            while data_port < 55700:
+                try:
+                    s_data = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+                    s_data.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+                    s_data.bind((listener_ip, data_port))
+                    s_data.listen(1)
+                    s_data.settimeout(10)
+                    break
+                except OSError:
+                    data_port += 1
+                    s_data = None
+            if not s_data:
+                s.close()
+                return None, "NO PORT AVAILABLE"
+
+            p1, p2 = data_port // 256, data_port % 256
+            ip_parts = listener_ip.split(".")
+            s.sendall(f"PORT {ip_parts[0]},{ip_parts[1]},{ip_parts[2]},{ip_parts[3]},{p1},{p2}\r\n".encode())
+            s.recv(1024)
+
+            s.sendall(cmd.encode() + b"\r\n")
+            s.recv(1024)
+
+            try:
+                conn, _ = s_data.accept()
+                data = b""
+                while True:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                conn.close()
+            except _sock.timeout:
+                data = b""
+            s_data.close()
+            s.close()
+            return data.decode(errors="replace"), None
+        else:
+            s.sendall(cmd.encode() + b"\r\n")
+            resp = s.recv(4096)
+            s.close()
+            return resp.decode(errors="replace"), None
 
     try:
-        ftp = ftplib.FTP()
-        ftp.connect(target_ip, port, timeout=10)
-        info["banner"] = ftp.getwelcome() or ""
-        ftp.login()  # anonymous
-        info["anonymous"] = True
-        print(f"    [+] ENUM: FTP ANONYMOUS login succeeded")
-
-        def _collect(lines_item: List[str]) -> None:
-            lines_item.append
-
-        collected: List[str] = []
+        # Detect our listener IP
+        import utils as _utils
+        listener_ip = "10.10.14.96"  # default VPN IP
         try:
-            ftp.retrlines("LIST", collected.append)
-        except ftplib.error_perm:
+            det_result = _utils.run_command("ip -4 addr show tun0 2>/dev/null | grep -oP 'inet \\K[\\d.]+'", timeout=3)
+            if det_result.get("stdout", "").strip():
+                listener_ip = det_result["stdout"].strip()
+        except Exception:
             pass
-        info["raw"] = "\n".join(collected)
-        # Parse out filenames (best-effort)
-        for ln in collected:
-            parts = ln.split()
-            if len(parts) >= 9:
-                info["files"].append(" ".join(parts[8:]))
-        # Also try recursive-ish listing of common dirs
-        for dirname in ("pub", "upload", "incoming", "share"):
-            try:
-                sub: List[str] = []
-                ftp.cwd(dirname)
-                ftp.retrlines("LIST", sub.append)
-                for ln in sub:
+
+        # Test anonymous login + get banner
+        banner_sock = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        banner_sock.settimeout(5)
+        banner_sock.connect((target_ip, port))
+        banner = banner_sock.recv(1024).decode(errors="replace").strip()
+        info["banner"] = banner
+        banner_sock.sendall(b"USER anonymous\r\n")
+        banner_sock.recv(1024)
+        banner_sock.sendall(b"PASS anonymous@\r\n")
+        auth_resp = banner_sock.recv(1024).decode(errors="replace")
+        banner_sock.close()
+
+        if "230" in auth_resp:
+            info["anonymous"] = True
+            print(f"    [+] ENUM: FTP ANONYMOUS login succeeded")
+
+            # List root directory using active mode
+            root_listing, err = _ftp_cmd("LIST", collect_data=True, listener_ip=listener_ip)
+            if root_listing and root_listing != "AUTH FAILED":
+                info["raw"] = root_listing
+                for ln in root_listing.split("\n"):
                     parts = ln.split()
                     if len(parts) >= 9:
-                        info["files"].append(f"{dirname}/" + " ".join(parts[8:]))
-                ftp.cwd("/")
-            except ftplib.error_perm:
-                pass
-        try:
-            ftp.quit()
-        except Exception:  # noqa: BLE001
-            try:
-                ftp.close()
-            except Exception:  # noqa: BLE001
-                pass
-    except (ftplib.error_perm, ftplib.error_temp, OSError, EOFError) as exc:
-        print(f"    [+] ENUM: FTP anonymous login failed: {exc}")
+                        fname = " ".join(parts[8:])
+                        if fname not in (".", ".."):
+                            info["files"].append(fname)
 
-    if info["anonymous"] and info["files"]:
-        print(f"    [+] ENUM: FTP listed {len(info['files'])} files")
+            # Explore common + Dante-specific directories
+            extra_dirs = ["pub", "upload", "incoming", "share", "Transfer", "Transfer/Incoming", "Transfer/Outgoing"]
+            for dirname in extra_dirs:
+                listing, err = _ftp_cmd(f"LIST {dirname}", collect_data=True, listener_ip=listener_ip)
+                if listing and "AUTH FAILED" not in listing and listing.strip():
+                    for ln in listing.split("\n"):
+                        parts = ln.split()
+                        if len(parts) >= 9:
+                            fname = " ".join(parts[8:])
+                            if fname not in (".", ".."):
+                                full_path = f"{dirname}/{fname}"
+                                info["files"].append(full_path)
+
+                                # Download text files (check for flags/creds)
+                                if any(fname.endswith(ext) for ext in ['.txt', '.cfg', '.conf', '.md', '.json', '.csv']):
+                                    content, _ = _ftp_cmd(f"RETR {dirname}/{fname}", collect_data=True, listener_ip=listener_ip)
+                                    if content and len(content) < 10000:
+                                        info["file_contents"][full_path] = content
+
+            if info["files"]:
+                print(f"    [+] ENUM: FTP listed {len(info['files'])} files")
+                for fn in info["files"][:10]:
+                    print(f"      → {fn}")
+
+        else:
+            print(f"    [+] ENUM: FTP anonymous login failed")
+    except Exception as exc:
+        print(f"    [+] ENUM: FTP check error: {exc}")
+
     return info
 
 
