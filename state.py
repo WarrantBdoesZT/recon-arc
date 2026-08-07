@@ -19,7 +19,7 @@ def _strip_ansi(text: str) -> str:
     return _re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
 
 
-def _dedup_findings(a: list, b: list, limit: int = 500) -> list:
+def _dedup_findings(a: list, b: list) -> list:
     """Merge findings lists, strip ANSI, dedup by content."""
     import re as _re
     seen = set()
@@ -29,30 +29,30 @@ def _dedup_findings(a: list, b: list, limit: int = 500) -> list:
         if clean not in seen:
             seen.add(clean)
             result.append(clean)
-    return result[-limit:]
+    return result[-500:]
 
 
 # ── Dedup Reducers for LangGraph ──────────────────────────────────────
 
-def _dedup_by_id(a: list, b: list, limit: int = 500) -> list:
+def _dedup_by_id(a: list, b: list) -> list:
     """Merge two lists, deduplicating by 'id' field. Last write wins."""
     seen = {}
     for item in (a + b):
         key = item.get("id", "") if isinstance(item, dict) else str(item)
         seen[key] = item
-    return list(seen.values())[-limit:]
+    return list(seen.values())[-500:]
 
 
-def _dedup_by_value(a: list, b: list, limit: int = 50) -> list:
+def _dedup_by_value(a: list, b: list) -> list:
     """Merge two lists, deduplicating flags by 'flag_value' field."""
     seen = {}
     for item in (a + b):
         key = item.get("flag_value", "") if isinstance(item, dict) else str(item)
         seen[key] = item
-    return list(seen.values())[-limit:]
+    return list(seen.values())[-50:]
 
 
-def _dedup_by_cred(a: list, b: list, limit: int = 200) -> list:
+def _dedup_by_cred(a: list, b: list) -> list:
     """Merge credential lists, dedup by username:password hash:key_path."""
     seen = {}
     for item in (a + b):
@@ -61,10 +61,10 @@ def _dedup_by_cred(a: list, b: list, limit: int = 200) -> list:
         else:
             key = str(item)
         seen[key] = item
-    return list(seen.values())[-limit:]
+    return list(seen.values())[-200:]
 
 
-def _dedup_by_target_vector(a: list, b: list, limit: int = 200) -> list:
+def _dedup_by_target_vector(a: list, b: list) -> list:
     """Merge exploit_attempts, dedup by (target, vector_id) pair."""
     seen = {}
     for item in (a + b):
@@ -73,10 +73,10 @@ def _dedup_by_target_vector(a: list, b: list, limit: int = 200) -> list:
         else:
             key = str(item)
         seen[key] = item
-    return list(seen.values())[-limit:]
+    return list(seen.values())[-200:]
 
 
-def _dedup_by_host_cred(a: list, b: list, limit: int = 100) -> list:
+def _dedup_by_host_cred(a: list, b: list) -> list:
     """Merge lateral_attempts, dedup by (to_host, credential_id) pair."""
     seen = {}
     for item in (a + b):
@@ -85,7 +85,7 @@ def _dedup_by_host_cred(a: list, b: list, limit: int = 100) -> list:
         else:
             key = str(item)
         seen[key] = item
-    return list(seen.values())[-limit:]
+    return list(seen.values())[-100:]
 
 
 class ServiceInfo(TypedDict):
