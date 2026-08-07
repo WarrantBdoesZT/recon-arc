@@ -67,9 +67,31 @@ FLAG_PATTERNS = [
     r"FLAG\{[^}]+\}",          # Generic
     r"flag\{[^}]+\}",          # Generic lowercase
     r"CTF\{[^}]+\}",           # CTF format
+    r"DANTE\{[^}]+\}",         # Dante Pro Lab
+    r"OFFSHORE\{[^}]+\}",      # Offshore Pro Lab
     r"[a-f0-9]{32}",           # MD5 hash format (legacy HTB)
     r"[a-f0-9]{64}",           # SHA256 format
 ]
+
+# Strict patterns for env vars — only match known flag formats, NOT raw hashes
+# (API keys, session IDs, etc. can look like MD5 hashes)
+FLAG_PATTERNS_STRICT = [
+    r"HTB\{[^}]+\}",
+    r"FLAG\{[^}]+\}",
+    r"flag\{[^}]+\}",
+    r"CTF\{[^}]+\}",
+    r"DANTE\{[^}]+\}",
+    r"OFFSHORE\{[^}]+\}",
+]
+
+# Env var names to skip (common false positives)
+ENV_BLOCKLIST = {
+    "GLM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+    "INVOCATION_ID", "JOURNAL_STREAM", "SESSION_ID",
+    "SHLVL", "PATH", "HOME", "PWD", "OLDPWD", "_",
+    "LANG", "TERM", "SHELL", "USER", "LOGNAME",
+    "HOSTNAME", "HOST", "DISPLAY", "XAUTHORITY",
+}
 
 # Common flag-related filenames to search for
 FLAG_FILENAMES = [
@@ -164,16 +186,19 @@ def hunt_linux_flags(transport=None) -> List[Dict]:
                     })
                     print(f"  [FLAG] ✓ Pattern match in {filepath}: {match[:40]}...")
 
-    # Phase 4: Check environment variables
+    # Phase 4: Check environment variables (use strict patterns to avoid false positives)
     result = _execute(transport, "env 2>/dev/null")
     if result.get("stdout", ""):
         for line in result["stdout"].split("\n"):
-            for pattern in FLAG_PATTERNS:
+            var_name = line.split("=")[0] if "=" in line else ""
+            if var_name in ENV_BLOCKLIST:
+                continue
+            for pattern in FLAG_PATTERNS_STRICT:
                 matches = re.findall(pattern, line)
                 for match in matches:
                     flags.append({
                         "flag_value": match,
-                        "path": "env:" + line.split("=")[0] if "=" in line else "env",
+                        "path": f"env:{var_name}" if var_name else "env",
                         "method": "environment",
                     })
                     print(f"  [FLAG] ✓ In env var: {match[:40]}...")
