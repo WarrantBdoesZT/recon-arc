@@ -13,6 +13,81 @@ from datetime import datetime
 from typing import Annotated, Dict, List, Optional, TypedDict
 
 
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI escape codes from text."""
+    import re as _re
+    return _re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
+
+
+def _dedup_findings(a: list, b: list, limit: int = 500) -> list:
+    """Merge findings lists, strip ANSI, dedup by content."""
+    import re as _re
+    seen = set()
+    result = []
+    for item in (a + b):
+        clean = _re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', str(item)) if isinstance(item, str) else str(item)
+        if clean not in seen:
+            seen.add(clean)
+            result.append(clean)
+    return result[-limit:]
+
+
+# ── Dedup Reducers for LangGraph ──────────────────────────────────────
+
+def _dedup_by_id(a: list, b: list, limit: int = 500) -> list:
+    """Merge two lists, deduplicating by 'id' field. Last write wins."""
+    seen = {}
+    for item in (a + b):
+        key = item.get("id", "") if isinstance(item, dict) else str(item)
+        seen[key] = item
+    return list(seen.values())[-limit:]
+
+
+def _dedup_by_value(a: list, b: list, limit: int = 50) -> list:
+    """Merge two lists, deduplicating flags by 'flag_value' field."""
+    seen = {}
+    for item in (a + b):
+        key = item.get("flag_value", "") if isinstance(item, dict) else str(item)
+        seen[key] = item
+    return list(seen.values())[-limit:]
+
+
+def _dedup_by_cred(a: list, b: list, limit: int = 200) -> list:
+    """Merge credential lists, dedup by username:password hash:key_path."""
+    seen = {}
+    for item in (a + b):
+        if isinstance(item, dict):
+            key = f"{item.get('username','')}:{item.get('password','')}:{item.get('hash','')}:{item.get('key_path','')}"
+        else:
+            key = str(item)
+        seen[key] = item
+    return list(seen.values())[-limit:]
+
+
+def _dedup_by_target_vector(a: list, b: list, limit: int = 200) -> list:
+    """Merge exploit_attempts, dedup by (target, vector_id) pair."""
+    seen = {}
+    for item in (a + b):
+        if isinstance(item, dict):
+            key = f"{item.get('target','')}:{item.get('vector_id','')}"
+        else:
+            key = str(item)
+        seen[key] = item
+    return list(seen.values())[-limit:]
+
+
+def _dedup_by_host_cred(a: list, b: list, limit: int = 100) -> list:
+    """Merge lateral_attempts, dedup by (to_host, credential_id) pair."""
+    seen = {}
+    for item in (a + b):
+        if isinstance(item, dict):
+            key = f"{item.get('to_host','')}:{item.get('credential_id','')}"
+        else:
+            key = str(item)
+        seen[key] = item
+    return list(seen.values())[-limit:]
+
+
 class ServiceInfo(TypedDict):
     port: int
     protocol: str        # tcp, udp
@@ -211,10 +286,10 @@ class ReconState(TypedDict):
     hosts: Annotated[Dict[str, NetworkHost], lambda a, b: {**a, **b}]
 
     # All discovered attack vectors across all hosts
-    attack_vectors: Annotated[List[AttackVector], lambda a, b: (a + b)[-500:]]
+    attack_vectors: Annotated[List[AttackVector], _dedup_by_id]
 
     # Credentials found during enumeration (not exploited, just discovered)
-    discovered_credentials: Annotated[List[dict], lambda a, b: (a + b)[-200:]]
+    discovered_credentials: Annotated[List[dict], _dedup_by_cred]
 
     # Accessible networks
     accessible_subnets: List[str]
@@ -232,7 +307,7 @@ class ReconState(TypedDict):
 
     # LLM context accumulation
     messages: Annotated[List[str], lambda a, b: (a + b)[-50:]]
-    findings: Annotated[List[str], lambda a, b: (a + b)[-500:]]
+    findings: Annotated[List[str], _dedup_findings]
     errors: Annotated[List[str], lambda a, b: (a + b)[-100:]]
 
     # Iteration control
@@ -262,20 +337,20 @@ class ReconState(TypedDict):
     _analysis_done: bool
 
     # Post-exploitation state (v5)
-    sessions: Annotated[List[Session], lambda a, b: (a + b)[-50:]]  # active access sessions
+    sessions: Annotated[List[Session], _dedup_by_id]
     compromised_hosts: Annotated[Dict[str, CompromisedHost], lambda a, b: {**a, **b}]
-    topology_edges: Annotated[List[NetworkEdge], lambda a, b: (a + b)[-200:]]
-    all_credentials: Annotated[List[Credential], lambda a, b: (a + b)[-200:]]  # structured creds
+    topology_edges: Annotated[List[NetworkEdge], _dedup_by_id]
+    all_credentials: Annotated[List[Credential], _dedup_by_cred]
     active_transport: str        # name of the active transport (for routing commands)
     pivot_depth: int             # how many hops from the VPN entry point
     session_file: str            # path to session config file for loading transports
 
     # Offensive operations state (v7)
-    flags_captured: Annotated[List[FlagEntry], lambda a, b: (a + b)[-50:]]
-    exploit_attempts: Annotated[List[ExploitAttempt], lambda a, b: (a + b)[-200:]]
-    active_tunnels: Annotated[List[Tunnel], lambda a, b: (a + b)[-20:]]
+    flags_captured: Annotated[List[FlagEntry], _dedup_by_value]
+    exploit_attempts: Annotated[List[ExploitAttempt], _dedup_by_target_vector]
+    active_tunnels: Annotated[List[Tunnel], _dedup_by_id]
     privesc_results: Annotated[Dict[str, PrivescResult], lambda a, b: {**a, **b}]
-    lateral_attempts: Annotated[List[LateralAttempt], lambda a, b: (a + b)[-100:]]
+    lateral_attempts: Annotated[List[LateralAttempt], _dedup_by_host_cred]
     kill_chain_phase: str        # recon, exploit, privesc, lateral, pivot, flag_hunt
     exploit_threshold: int       # minimum score to auto-exploit (default 70)
     flags_found_count: int       # running total

@@ -616,9 +616,12 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
                             new_findings.append(f"[!] WordPress DB credentials: {cred_info} [CRITICAL]")
 
                             # Add to state credentials
+                            _db_user = db_user.group(1) if db_user else ""
+                            _db_pass = db_pass.group(1) if db_pass else ""
                             state["all_credentials"] = state.get("all_credentials", []) + [{
-                                "username": db_user.group(1) if db_user else "",
-                                "password": db_pass.group(1) if db_pass else "",
+                                "id": f"wp_db_cred_{target}_{port}",
+                                "username": _db_user,
+                                "password": _db_pass,
                                 "service": "mysql",
                                 "source": f"wp-config.php backup ({wp_base})",
                                 "validated": False,
@@ -643,6 +646,41 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
                 debug_resp = _req.get(f"{wp_base}/wp-content/debug.log", timeout=3, verify=False)
                 if debug_resp.status_code == 200 and len(debug_resp.text) > 10:
                     new_findings.append(f"[!] WordPress debug.log exposed ({len(debug_resp.text)}b)")
+
+                # Enumerate WP users via REST API and author archives
+                try:
+                    rest_resp = _req.get(f"{wp_base}/wp-json/wp/v2/users", timeout=8, verify=False)
+                    wp_users = []
+                    if rest_resp.status_code == 200:
+                        import json as _json
+                        users_data = _json.loads(rest_resp.text)
+                        wp_users = [u.get("slug") or u.get("name", "") for u in users_data]
+                    if not wp_users:
+                        # Fallback: check author=1 redirect
+                        for aid in range(1, 5):
+                            author_resp = _req.get(
+                                f"{wp_base}/?author={aid}",
+                                timeout=5, verify=False, allow_redirects=False)
+                            if author_resp.status_code in (301, 302):
+                                loc = author_resp.headers.get("Location", "")
+                                user_match = _re.search(r'/author/([^/]+)/', loc)
+                                if user_match:
+                                    wp_users.append(user_match.group(1))
+                    if wp_users:
+                        wp_users_str = ", ".join(wp_users)
+                        new_findings.append(f"[CMS] WordPress users: {wp_users_str}")
+                        # Store for exploit phase
+                        for u in wp_users:
+                            state["all_credentials"] = state.get("all_credentials", []) + [{
+                                "username": u,
+                                "password": None,
+                                "service": "wordpress",
+                                "source": f"WP REST API ({wp_base})",
+                                "validated": False,
+                                "validated_against": "",
+                            }]
+                except Exception:
+                    pass
 
                 break
         except Exception:
