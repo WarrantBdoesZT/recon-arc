@@ -9,8 +9,11 @@ An LLM-powered enumeration agent for HackTheBox Academy labs and CTF environment
 - 🌐 **Full-spectrum enumeration**: Network discovery, port scanning, service fingerprinting, web app analysis, AD enumeration
 - 🎯 **Attack vector ranking**: Heuristic + LLM-powered scoring of every discovered attack path
 - 💡 **Exploit suggestions**: Specific commands and tools for each identified vector
-- 🔒 **Exploit-free**: Never executes exploits, shells, or credential attacks — pure reconnaissance
-- 🤖 **LLM-powered analysis**: Uses GLM-5.2 for strategic attack path analysis and ranking
+- 🔒 **Exploit-free recon mode**: `enum_agent.py` never executes exploits — pure reconnaissance
+- ⚔️ **Full kill-chain mode**: `strike_agent.py --exploit` → exploit → privesc → lateral → pivot → flag hunt
+- 🧑‍✈️ **Interactive copilot mode**: `--interactive` — recon runs autonomously, exploitation decisions go to the human (LLM proposes ranked hypotheses, you approve). `--auto-approve` lets high-confidence hypotheses run unattended
+- 🔑 **Credential manager**: Deterministic dedup, spray history (never re-test the same cred/host pair), spray-target filter that skips web-only hosts
+- 🤖 **LLM-powered analysis**: Uses GLM-5.3 for strategic attack path analysis and ranking
 - 📊 **Professional reports**: Generates Markdown reports with risk matrices and actionable next steps
 - 💾 **Session save/resume**: Full state persistence for long-running engagements
 - 🔌 **Offline mode**: `--no-llm` flag for fully heuristic-based operation

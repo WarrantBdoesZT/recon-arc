@@ -248,6 +248,14 @@ Examples:
         help="Enable exploitation mode (full kill-chain: exploit → privesc → lateral → flag hunt)",
     )
     parser.add_argument(
+        "--interactive", "--copilot", action="store_true",
+        help="Interactive copilot mode: recon runs autonomously, exploitation decisions go to the human",
+    )
+    parser.add_argument(
+        "--auto-approve", action="store_true",
+        help="Copilot mode: auto-approve high-confidence hypotheses (still pauses on medium/low)",
+    )
+    parser.add_argument(
         "--exploit-threshold", type=int, default=70,
         help="Minimum attack vector score to auto-exploit (default: 70)",
     )
@@ -306,6 +314,8 @@ Examples:
         state["cve_research"] = args.cve_research
         state["quick_mode"] = args.quick
         state["exploit_threshold"] = args.exploit_threshold
+        if args.interactive:
+            state["auto_approve"] = args.auto_approve
 
         # Load session file
         if args.session_file:
@@ -393,6 +403,24 @@ Examples:
         return
 
     # Build and run the graph
+    if args.interactive:
+        print("\n[GRAPH] Building copilot graph...")
+        try:
+            from copilot import run_copilot
+        except ImportError as e:
+            print(f"[!] Copilot module unavailable: {e}")
+            sys.exit(1)
+        print("[GRAPH] Nodes: scope → discover → enumerate → copilot_checkpoint → report")
+        print(f"\n[ENGAGEMENT] Starting copilot session (session: {state['session_id']})")
+        print("-" * 60)
+        try:
+            run_copilot(state)
+        except KeyboardInterrupt:
+            print("\n\n[!] Interrupted by user.")
+            print(f"[SESSION] Resume with --interactive --resume {state.get('save_path', '')}")
+            sys.exit(0)
+        return
+
     print("\n[GRAPH] Building kill-chain graph...")
     app = build_graph(exploit_mode=args.exploit)
     print(f"[GRAPH] Graph compiled — {'STRIKE' if args.exploit else 'RECON'} mode")

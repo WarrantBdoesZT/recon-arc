@@ -355,6 +355,10 @@ class ReconState(TypedDict):
     exploit_threshold: int       # minimum score to auto-exploit (default 70)
     flags_found_count: int       # running total
 
+    # Interactive copilot mode (v7.9)
+    auto_approve: bool                    # auto-approve high-confidence hypotheses
+    _copilot_skip_hosts: List[str]        # hosts the operator chose to skip
+
     # Session
     session_id: str
     save_path: str
@@ -423,6 +427,8 @@ def initial_state(
         kill_chain_phase="recon",
         exploit_threshold=70,
         flags_found_count=0,
+        auto_approve=False,
+        _copilot_skip_hosts=[],
         session_id=session_id,
         save_path=f"~/projects/recon-arc/saves/{session_id}.json",
     )

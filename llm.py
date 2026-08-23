@@ -1,7 +1,7 @@
 """
 StrikeARC — LLM Provider Configuration
 ======================================
-GLM-5.2 (Z.AI) with retry logic.
+GLM-5.3 (Z.AI) with retry logic.
 Three-tier: planner (JSON, cheap) + analyst (medium) + report (max output).
 Supports --no-llm mode for fully offline operation.
 """
@@ -39,7 +39,7 @@ def load_api_key() -> str:
 
 API_KEY = load_api_key()
 BASE_URL = os.environ.get("GLM_BASE_URL", "https://api.z.ai/api/coding/paas/v4")
-MODEL = os.environ.get("GLM_MODEL", "glm-5.2")
+MODEL = os.environ.get("GLM_MODEL", "glm-5.3")
 
 # Three-tier LLM
 _planner_llm: Optional[ChatOpenAI] = None      # JSON planning (2048 tokens)
