@@ -1240,6 +1240,32 @@ def _enumerate_extra_services(state, host, target, new_findings):
                     if any(kw in lower_content for kw in ["password", "credential", "lfi", "reset", "pending", "todo", "secret"]):
                         new_findings.append(f"[!] Intel in {fname} — potential actionable info")
 
+                    # Extract credentials from FTP file contents
+                    # Matches user:pass@host, password=value, DB_USER/DB_PASSWORD
+                    for cred_pat, cred_type in [
+                        (r'https?://([^:/\s]+):([^@\s]+)@', 'url_cred'),
+                        (r'(?:password|passwd|pwd)\s*[=:]\s*[\'"]?([^\'"\s;]{4,60})', 'password_kv'),
+                        (r'DB_PASSWORD[=:\'\"]+\s*[\'"]?([^\'"]+)', 'wp_db_pass'),
+                        (r'DB_USER[=:\'\"]+\s*[\'"]?([^\'"]+)', 'wp_db_user'),
+                    ]:
+                        for cm2 in _re.finditer(cred_pat, content, _re.IGNORECASE):
+                            try:
+                                if cred_type == 'url_cred':
+                                    u, v = cm2.group(1), cm2.group(2)
+                                elif cred_type == 'wp_db_pass':
+                                    u, v = 'wp_db', cm2.group(1)
+                                elif cred_type == 'wp_db_user':
+                                    u, v = cm2.group(1), None
+                                else:
+                                    u, v = '?', cm2.group(1)
+                                if v and v.lower() not in ('none', 'null', 'true', 'false', ''):
+                                    new_findings.append(
+                                        f"[CRED] FTP {fname}: {u}:{v[:20]} ({cred_type})"
+                                    )
+                                    print(f"    [CRED] FTP {fname}: {u}:{v[:20]}")
+                            except (IndexError, ValueError):
+                                continue
+
 
 def _run_cve_research_host(state, host, target, new_findings):
     """Per-host CVE research — runs during enumeration, not just analyze."""
@@ -1776,6 +1802,9 @@ def scope_node(state: ReconState) -> ReconState:
         return {**state, "current_phase": "pivot"}
 
     # Priority 4: Check stall condition
+    # If no new findings were added since last iteration, we're spinning.
+    # With the credential explosion bug fixed, legitimate stalls indicate
+    # all vectors are exhausted — go to report immediately.
     findings_len = len(state["findings"])
     if state.get("last_findings_len") == findings_len:
         state["stall_count"] = state.get("stall_count", 0) + 1
@@ -1783,8 +1812,24 @@ def scope_node(state: ReconState) -> ReconState:
         state["stall_count"] = 0
     state["last_findings_len"] = findings_len
 
-    if state.get("stall_count", 0) >= 2:
-        print("\n  [*] No new findings. Generating report.")
+    if state.get("stall_count", 0) >= 1:
+        # Check if there are any remaining unexploited vectors below the
+        # current threshold before giving up entirely
+        attempted_ids = {a["vector_id"] for a in state.get("exploit_attempts", [])}
+        remaining = [
+            v for v in state.get("attack_vectors", [])
+            if v.get("id") not in attempted_ids
+        ]
+        if remaining:
+            # Lower the threshold and try again
+            best_remaining = max(remaining, key=lambda v: v.get("score", 0))
+            threshold = state.get("exploit_threshold", 70)
+            state["exploit_threshold"] = max(best_remaining.get("score", 0), 30)
+            print(f"\n  [!] Stall detected. Lowering exploit threshold to {state['exploit_threshold']} "
+                  f"to try {len(remaining)} remaining vectors.")
+            state["stall_count"] = 0  # reset to allow one more attempt
+            return {**state, "current_phase": "scope"}
+        print("\n  [*] No new findings and no remaining vectors. Generating report.")
         return {**state, "current_phase": "report"}
 
     # Fallback to LLM for strategic direction
