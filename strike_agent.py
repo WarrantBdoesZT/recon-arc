@@ -230,6 +230,11 @@ Examples:
     )
     parser.add_argument("--subnet", "-s", help="Subnet to scan (CIDR)")
     parser.add_argument("--targets", "-t", nargs="*", help="Specific host IPs")
+    parser.add_argument(
+        "--sweep", action="store_true",
+        help="With --targets: also sweep the derived /24 for additional hosts "
+             "(finds pivot/dual-homed neighbors the single target can't see)",
+    )
     parser.add_argument("--exclude", nargs="*", help="Host IPs to exclude")
     parser.add_argument("--goals", "-g", nargs="*", default=[], help="Engagement goals")
     parser.add_argument("--max-iterations", "-i", type=int, default=50, help="Max iterations (default: 50)")
@@ -372,7 +377,11 @@ Examples:
                     print(f"  [+] {ip}: {len(services)} services, OS: {os_hint}")
                 else:
                     print(f"  [!] {ip}: no services detected (may need sudo for SYN scan)")
-            state["scanned_subnets"] = [subnet]
+            state["scanned_subnets"] = [subnet] if not args.sweep else []
+
+            if args.sweep:
+                print("  [SWEEP] Subnet left unscanned — discovery will sweep "
+                      f"{subnet} for additional hosts (pivot/neighbor discovery)")
 
         if args.quick:
             state["max_iterations"] = min(state["max_iterations"], 3)
