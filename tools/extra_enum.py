@@ -534,6 +534,12 @@ def check_ftp_content(target_ip: str, port: int = 21) -> dict:
                         if fname not in (".", ".."):
                             info["files"].append(fname)
 
+                            # Download root text files (check for flags/creds)
+                            if any(fname.endswith(ext) for ext in ['.txt', '.cfg', '.conf', '.md', '.json', '.csv']):
+                                content, _ = _ftp_cmd(f"RETR {fname}", collect_data=True, listener_ip=listener_ip)
+                                if content and "AUTH FAILED" not in content and len(content) < 10000:
+                                    info["file_contents"][fname] = content
+
             # Explore common + Dante-specific directories
             extra_dirs = ["pub", "upload", "incoming", "share", "Transfer", "Transfer/Incoming", "Transfer/Outgoing"]
             for dirname in extra_dirs:
