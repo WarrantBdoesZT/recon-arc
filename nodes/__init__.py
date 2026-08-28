@@ -1802,10 +1802,25 @@ def scope_node(state: ReconState) -> ReconState:
     _merged_vecs = list(state.get("attack_vectors", []))
     for _h in state["hosts"].values():
         _merged_vecs.extend(_h.get("attack_vectors", []))
-    unexploited = [
-        v for v in _merged_vecs
-        if v.get("score", 0) >= threshold and v.get("id") not in attempted_ids
-    ]
+    # v8.2.1 selection guard (run-12 lesson): only offer vectors whose type
+    # has a registered exploit handler. Without this, 9/15 resume-run
+    # iterations dispatched xss ("Missing CSP") vectors that attempt_exploit
+    # could only reject with "No exploit handler" — guaranteed no-ops.
+    try:
+        from tools.exploit import HANDLED_VECTOR_TYPES
+    except ImportError:
+        HANDLED_VECTOR_TYPES = None  # older exploit module: skip guard
+    _skipped_unhandled = 0
+    unexploited = []
+    for v in _merged_vecs:
+        if v.get("score", 0) < threshold or v.get("id") in attempted_ids:
+            continue
+        if HANDLED_VECTOR_TYPES is not None and v.get("vector_type", "").lower() not in HANDLED_VECTOR_TYPES:
+            _skipped_unhandled += 1
+            continue
+        unexploited.append(v)
+    if _skipped_unhandled and not unexploited:
+        print(f"  [i] {_skipped_unhandled} vectors skipped at selection — no exploit handler for their type")
     if unexploited:
         best = max(unexploited, key=lambda v: v.get("score", 0))
         print(f"\n  → ACTION: Exploit {best.get('target', '?')} — {best.get('title', '?')} (score: {best.get('score', 0)})")
