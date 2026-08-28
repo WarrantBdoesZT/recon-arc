@@ -1988,6 +1988,31 @@ def _llm_strategic_plan(state: ReconState) -> Optional[dict]:
     if domain_users:
         user_context = f"\n## Known Usernames\n{', '.join(sorted(set(domain_users))[:30])}\n"
 
+    # v8.2.2 (run-14): show the planner what's actually attackable — the
+    # old menu (discover/enumerate/analyze/report) could never order an
+    # attack, so stall→analyze→stall looped forever without dispatching.
+    try:
+        from tools.exploit import HANDLED_VECTOR_TYPES
+    except ImportError:
+        HANDLED_VECTOR_TYPES = None
+    attempted = {a.get("vector_id", "") for a in state.get("exploit_attempts", [])}
+    _vecs = list(state.get("attack_vectors", []))
+    for _h in state.get("hosts", {}).values():
+        _vecs.extend(_h.get("attack_vectors", []))
+    threshold = state.get("exploit_threshold", 70)
+    eligible = [
+        v for v in _vecs
+        if v.get("id") not in attempted
+        and v.get("score", 0) >= threshold
+        and (HANDLED_VECTOR_TYPES is None
+             or v.get("vector_type", "").lower() in HANDLED_VECTOR_TYPES)
+    ]
+    n_unattempted = len(eligible)
+    best_vector_desc = "none eligible"
+    if eligible:
+        _best = max(eligible, key=lambda v: v.get("score", 0))
+        best_vector_desc = f"{_best.get('title', '?')} → {_best.get('target', '?')} (score {_best.get('score', 0)})"
+
     prompt = f"""You are the strategic planner for an enumeration engagement.
 
 ## Current State
@@ -1997,6 +2022,9 @@ def _llm_strategic_plan(state: ReconState) -> Optional[dict]:
 - discover: Scan for new hosts (if new subnets accessible)
 - enumerate: Deep-dive on a host
 - analyze: Re-analyze findings for attack paths
+- exploit: Dispatch the best unattempted attack vector NOW. Use this
+  when unattempted vectors exist ({n_unattempted} currently eligible,
+  e.g. {best_vector_desc}) — attacking beats more analysis.
 - report: Generate final report
 
 Return JSON only:
