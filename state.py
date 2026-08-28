@@ -9,6 +9,7 @@ and network topology graph for pivot operations.
 
 import json
 import os
+import operator
 from datetime import datetime
 from typing import Annotated, Dict, List, Optional, TypedDict
 
@@ -337,6 +338,11 @@ class ReconState(TypedDict):
     # Internal tracking (not persisted)
     _cve_research_done: bool
     _cred_test_done: bool
+
+    # Enumerated identities (SMTP VRFY, LDAP, enum4linux, etc.) — declared
+    # so LangGraph checkpoints persist them across resume; attack_path
+    # credential attacks (hydra -L fixup) consume them.
+    _domain_users: Annotated[List[str], operator.add]
     _analysis_done: bool
 
     # Post-exploitation state (v5)
