@@ -15,7 +15,7 @@ This module performs enumeration only — it does NOT execute exploits.
 import re
 from typing import Dict, List, Optional
 
-from utils import run_command
+from utils import run_command, swallow
 
 
 # ---------------------------------------------------------------------------
@@ -405,8 +405,8 @@ def subdomain_bruteforce(
                 first = stdout.splitlines()[0].strip()
                 if re.match(r"^\d+\.\d+\.\d+\.\d+$", first) or "." in first:
                     return f"{fqdn} -> {first}"
-        except Exception:
-            pass
+        except Exception as e:
+            swallow(__name__ + ":408", e)
         return None
 
     # Parallel subdomain resolution with thread pool
@@ -420,8 +420,8 @@ def subdomain_bruteforce(
                     if result:
                         discovered.append(result)
                         print(f"    [+] DNS: FOUND {result}")
-                except Exception:
-                    pass
+                except Exception as e:
+                    swallow(__name__ + ":423", e)
     except Exception:
         pass  # Timeout — we have what we have
 

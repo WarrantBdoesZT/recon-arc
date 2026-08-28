@@ -10,7 +10,7 @@ import re
 from typing import Dict, List, Optional
 from urllib.parse import urljoin
 
-from utils import run_command, http_get, http_post
+from utils import run_command, http_get, http_post, swallow
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +436,7 @@ def check_ftp_content(target_ip: str, port: int = 21) -> dict:
         "file_contents": {},
     }
 
-    def _ftp_cmd(cmd, collect_data=False, listener_ip="10.10.14.96"):
+    def _ftp_cmd(cmd, collect_data=False, listener_ip=""):
         """Send FTP command over raw socket with active mode data connection."""
         s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
         s.settimeout(8)
@@ -497,15 +497,24 @@ def check_ftp_content(target_ip: str, port: int = 21) -> dict:
             return resp.decode(errors="replace"), None
 
     try:
-        # Detect our listener IP
+        # Detect our listener IP from the route to the target (works for any
+        # VPN interface — tun0/tap0/pwnbg — falls back to tun0 then default)
         import utils as _utils
-        listener_ip = "10.10.14.96"  # default VPN IP
-        try:
-            det_result = _utils.run_command("ip -4 addr show tun0 2>/dev/null | grep -oP 'inet \\K[\\d.]+'", timeout=3)
-            if det_result.get("stdout", "").strip():
-                listener_ip = det_result["stdout"].strip()
-        except Exception:
-            pass
+        listener_ip = ""
+        for detect_cmd in (
+            f"ip -4 route get {target_ip} 2>/dev/null | grep -oP 'src \\\\K[\\\\d.]+'",
+            "ip -4 addr show tun0 2>/dev/null | grep -oP 'inet \\\\K[\\\\d.]+'",
+        ):
+            try:
+                det_result = _utils.run_command(detect_cmd, timeout=3)
+                ip_cand = det_result.get("stdout", "").strip()
+                if ip_cand:
+                    listener_ip = ip_cand
+                    break
+            except Exception as e:
+                swallow(__name__ + ":514", e)
+        if not listener_ip:
+            return None, "could not determine listener IP (no route to target)"
 
         # Test anonymous login + get banner
         banner_sock = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)

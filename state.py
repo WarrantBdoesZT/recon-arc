@@ -310,6 +310,9 @@ class ReconState(TypedDict):
     findings: Annotated[List[str], _dedup_findings]
     errors: Annotated[List[str], lambda a, b: (a + b)[-100:]]
 
+    # Vault knowledge matches (knowledge/retrieval.py) — notes injected at analyze time
+    knowledge_matches: List[dict]
+
     # Iteration control
     iteration: int
     max_iterations: int
@@ -396,6 +399,7 @@ def initial_state(
         messages=[],
         findings=[],
         errors=[],
+        knowledge_matches=[],
         iteration=0,
         max_iterations=max_iterations,
         stall_count=0,

@@ -36,7 +36,7 @@ import shlex
 import shutil
 from typing import Dict, List, Optional
 
-from utils import run_command
+from utils import run_command, swallow
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -490,8 +490,8 @@ def ssh_login(
         finally:
             try:
                 client.close()
-            except Exception:
-                pass
+            except Exception as e:
+                swallow(__name__ + ":493", e)
         return result
 
     if not result["error"]:

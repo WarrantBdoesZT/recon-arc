@@ -33,3 +33,6 @@ Thumbs.db
 hydra.restore
 *.pcap
 *.log
+
+# Vault knowledge registry (generated from local Obsidian vault; HTB-derived content — do NOT publish)
+knowledge/registry.json

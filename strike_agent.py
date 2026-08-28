@@ -268,6 +268,13 @@ Examples:
     parser.add_argument("--post-exploit", action="store_true", help="Run post-exploit enum")
     args = parser.parse_args()
 
+    # Preflight — surface missing external tooling before the engagement starts
+    try:
+        from tools.preflight import preflight_report
+        preflight_report(verbose=True)
+    except Exception as e:
+        print(f"[!] preflight skipped: {e}")
+
     print("=" * 60)
     if args.exploit:
         print("  StrikeARC — Kill-Chain Automation")

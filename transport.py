@@ -29,7 +29,7 @@ import subprocess
 import time
 from typing import Dict, List, Optional
 
-from utils import is_safe_command, run_command
+from utils import is_safe_command, run_command, swallow
 
 # ── Optional dependencies ─────────────────────────────────────────────
 # Imported lazily/optionally so the module loads even when the heavy
@@ -353,8 +353,8 @@ class SSHTransport(BaseTransport):
             if obj is not None:
                 try:
                     obj.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    swallow(__name__ + ":356", e)
                 setattr(self, attr, None)
 
 
@@ -755,8 +755,8 @@ class ProxyChainTransport(BaseTransport):
         for t in reversed(self._transports):
             try:
                 t.close()
-            except Exception:
-                pass
+            except Exception as e:
+                swallow(__name__ + ":758", e)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -797,8 +797,8 @@ class TransportManager:
         if transport is not None:
             try:
                 transport.close()
-            except Exception:
-                pass
+            except Exception as e:
+                swallow(__name__ + ":800", e)
         if self._active == name:
             self._active = next(iter(self._transports), None)
 
@@ -936,8 +936,8 @@ class TransportManager:
         for transport in self._transports.values():
             try:
                 transport.close()
-            except Exception:
-                pass
+            except Exception as e:
+                swallow(__name__ + ":939", e)
         self._transports.clear()
         self._active = None
 

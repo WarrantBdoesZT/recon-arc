@@ -38,7 +38,7 @@ import re
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse, parse_qs
 
-from utils import http_get, http_post
+from utils import http_get, http_post, swallow
 from state import AttackVector
 
 
@@ -192,8 +192,8 @@ def _looks_like_base64(text: str) -> bool:
         decoded = base64.b64decode(stripped, validate=True)
         if len(decoded) > 20 and decoded.isascii() or b"<?php" in decoded or b"<?" in decoded:
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        swallow(__name__ + ":195", e)
     return False
 
 
