@@ -89,6 +89,23 @@ def _dedup_by_host_cred(a: list, b: list) -> list:
     return list(seen.values())[-100:]
 
 
+def _dedup_users(a: list, b: list) -> list:
+    """Merge user lists, dedup by name, cap length.
+
+    CRITICAL: nodes return ``{**state, ...}`` (full state), so ``b`` already
+    contains everything in ``a``. With plain ``operator.add`` the list DOUBLES
+    on every node return (≈2× per iteration → 19 GB JSON, OOM SIGKILL on the
+    mail-box run 2026-08-27). Dedup + cap makes this channel idempotent.
+    """
+    merged: dict = {}
+    for item in (a + b):
+        if isinstance(item, str):
+            item = item.strip()
+        if item:
+            merged[item] = None
+    return list(merged)[-500:]
+
+
 class ServiceInfo(TypedDict):
     port: int
     protocol: str        # tcp, udp
@@ -342,7 +359,9 @@ class ReconState(TypedDict):
     # Enumerated identities (SMTP VRFY, LDAP, enum4linux, etc.) — declared
     # so LangGraph checkpoints persist them across resume; attack_path
     # credential attacks (hydra -L fixup) consume them.
-    _domain_users: Annotated[List[str], operator.add]
+    # MUST use a dedup+cap reducer: operator.add doubles the list every node
+    # return because nodes re-emit full state (run-10 OOM root cause).
+    _domain_users: Annotated[List[str], _dedup_users]
     _analysis_done: bool
 
     # Post-exploitation state (v5)
