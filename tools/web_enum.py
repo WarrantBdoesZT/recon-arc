@@ -6,6 +6,7 @@ NO exploitation — only passive and active enumeration.
 """
 
 import re
+import uuid
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -18,9 +19,34 @@ def directory_bust(
     extensions: str = "php,html,txt,bak,old,json,xml,yml,yaml,env,git",
     timeout: int = 120,
 ) -> List[dict]:
-    """Directory enumeration using gobuster."""
+    """Directory enumeration using gobuster.
+
+    BUGFIX (run 11): added wildcard calibration. Hosts that return 200
+    for EVERY path (soft-404 / wildcard vhosts, e.g. .60/.64:8000 in the
+    Aug 28 run) previously poisoned state with ~98k "directories" per
+    host (5.7 MB each). Now a random nonexistent path is baselined
+    first; if it 200s, the service is marked wildcard and only paths
+    whose size DIFFERS from the wildcard baseline are kept.
+    """
     parsed = urlparse(url)
     host = parsed.hostname or url
+
+    # ── wildcard calibration ────────────────────────────────────────
+    wildcard = False
+    baseline_size = -1
+    try:
+        import requests as _rq
+        probe_url = f"{parsed.scheme}://{parsed.netloc}/{uuid.uuid4().hex}{uuid.uuid4().hex}"
+        cal = _rq.get(probe_url, timeout=8, verify=False,
+                      headers={"User-Agent": "StrikeARC"})
+        if cal.status_code == 200:
+            wildcard = True
+            baseline_size = len(cal.text or "")
+    except Exception:
+        wildcard = False
+    if wildcard:
+        print(f"    [!] WILDCARD: {url} returns 200 for random paths "
+              f"(baseline {baseline_size}b) — filtering to size-differential hits only")
 
     cmd = (
         f"gobuster dir -u '{url}' -w '{wordlist}' "
@@ -38,7 +64,19 @@ def directory_bust(
                 path = m.group(1).strip()
                 status = int(m.group(2))
                 size = int(m.group(3))
+                # wildcard host: keep only responses that differ from the
+                # soft-404 baseline (status differs OR size differs >5%)
+                if wildcard:
+                    if status == 200 and baseline_size > 0:
+                        if abs(size - baseline_size) <= max(64, baseline_size * 0.05):
+                            continue  # identical to soft-404 — skip
                 dirs.append({"path": path, "status": status, "size": size})
+
+    # hard cap: never store more than 500 paths per web app (state-size
+    # hygiene — 98k-entry lists once crashed analysis context)
+    if len(dirs) > 500:
+        print(f"    [!] directory_bust: capping {len(dirs)} -> 500 results")
+        dirs = dirs[:500]
 
     return dirs
 

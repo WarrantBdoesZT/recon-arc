@@ -1437,7 +1437,12 @@ def _run_cred_test(state: ReconState) -> List[str]:
                     )
                     valid_creds.append((r["username"], r["password"], r["service"], ip))
                     # Store as Credential in state
-                    state.setdefault("credentials", []).append({
+                    # NOTE: must be `discovered_credentials` (declared in
+                    # ReconState). The old `state["credentials"]` key was
+                    # UNDECLARED → LangGraph silently dropped it on node
+                    # return → valid creds (e.g. admin:admin on run 11)
+                    # vanished from state before exploit/privesc phases.
+                    state.setdefault("discovered_credentials", []).append({
                         "username": r["username"],
                         "password": r["password"],
                         "source_host": ip,
@@ -1476,7 +1481,7 @@ def _run_cred_test(state: ReconState) -> List[str]:
                                     f"(HTTP 200 — reused from {src_ip})"
                                 )
                                 # Update credential record
-                                for cred_rec in state.get("credentials", []):
+                                for cred_rec in state.get("discovered_credentials", []):
                                     if cred_rec["username"] == username and cred_rec["password"] == password:
                                         if ip not in cred_rec["valid_on"]:
                                             cred_rec["valid_on"].append(ip)
@@ -2146,7 +2151,7 @@ def _generate_heuristic_report(state: ReconState, summary: str,
     if _HAS_CHAINS:
         try:
             chains = chain_mod.compose_chains(
-                vectors, state.get("credentials", []),
+                vectors, state.get("discovered_credentials", []),
                 state.get("hosts", {}), state.get("topology", {}),
             )
             if chains:

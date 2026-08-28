@@ -107,9 +107,19 @@ def _measure(resp) -> Dict:
 def _send_request(
     url: str, method: str, params: Dict, headers: Optional[Dict] = None,
 ) -> Optional[Dict]:
-    """Send a single request, timing it, and return a measurement dict."""
+    """Send a single request, timing it, and return a measurement dict.
+
+    BUGFIX (run 11): the GET branch previously called ``http_get(url)``
+    WITHOUT the params — every GET probe compared identical baselines,
+    so GET-parameter injection was undetectable. Build the query string
+    from ``params`` (payload included) and append it to the URL.
+    """
     start = time.time()
     if method.upper() == "GET":
+        if params:
+            from urllib.parse import urlencode as _urlencode
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}{_urlencode(params)}"
         resp = http_get(
             url, timeout=REQUEST_TIMEOUT, verify_ssl=False,
             headers=headers,
