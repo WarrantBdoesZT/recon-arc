@@ -20,7 +20,7 @@ from state import (
     get_engagement_summary, save_state,
 )
 from llm import llm_invoke, parse_llm_json, print_llm_stats
-from utils import run_command, detect_listener_ip, extract_emails, http_get
+from utils import run_command, detect_listener_ip, extract_emails, http_get, swallow
 
 import tools.recon as recon
 import tools.web_enum as web
@@ -268,11 +268,11 @@ def _enumerate_host(state, host, target, new_findings):
                                     url, vuln["parameter"], vuln
                                 )
                                 host.setdefault("attack_vectors", []).extend(vectors)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        swallow(__name__ + ":271", e)
 
-            except Exception:
-                pass
+            except Exception as e:
+                swallow(__name__ + ":274", e)
 
             # SSL cert analysis for HTTPS
             if scheme == "https":
@@ -293,8 +293,8 @@ def _enumerate_host(state, host, target, new_findings):
                             new_findings.append(f"[CERT] {url}: SELF-SIGNED certificate")
                         # Store for cross-host correlation
                         host.setdefault("cert_info", cert_info)
-                except Exception:
-                    pass
+                except Exception as e:
+                    swallow(__name__ + ":296", e)
 
         # Generate basic vectors from what we found
         vectors = vs.vectors_for_services(
@@ -411,8 +411,8 @@ def _enumerate_host(state, host, target, new_findings):
                                         )
                                         for rec in zt["records"][:10]:
                                             new_findings.append(f"  → {rec}")
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    swallow(__name__ + ":414", e)
                                 # Subdomain brute using discovered domain
                                 try:
                                     subs = dns.subdomain_bruteforce(target, domain)
@@ -422,10 +422,10 @@ def _enumerate_host(state, host, target, new_findings):
                                         )
                                         for sub in subs[:5]:
                                             state.setdefault("_discovered_domains", set()).add(sub)
-                                except Exception:
-                                    pass
-                except Exception:
-                    pass
+                                except Exception as e:
+                                    swallow(__name__ + ":425", e)
+                except Exception as e:
+                    swallow(__name__ + ":427", e)
             else:
                 cert = recon.ssl_cert_info(target, port)
                 if cert:
@@ -559,8 +559,8 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
                 path = path.strip()
                 if path and path != '/':
                     new_findings.append(f"  → robots.txt path: {path}")
-    except Exception:
-        pass
+    except Exception as e:
+        swallow(__name__ + ":562", e)
 
     # ── WordPress/CMS detection ─────────────────────────────────────
     wp_detected = False
@@ -605,8 +605,8 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
                                 capture_output=True, text=True, timeout=5
                             )
                             cfg_text = strings_result.stdout + cfg_text
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            swallow(__name__ + ":608", e)
 
                         db_user = _re.search(r"DB_USER['\"]*,\s*['\"]([^'\"]+)", cfg_text)
                         db_pass = _re.search(r"DB_PASSWORD['\"]*,\s*['\"]([^'\"]+)", cfg_text)
@@ -679,12 +679,12 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
                                 "validated": False,
                                 "validated_against": "",
                             }]
-                except Exception:
-                    pass
+                except Exception as e:
+                    swallow(__name__ + ":682", e)
 
                 break
-        except Exception:
-            pass
+        except Exception as e:
+            swallow(__name__ + ":686", e)
 
     # Directory bust
     print(f"  [>] Directory busting {url}...")
@@ -800,8 +800,8 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
                         vector = lfi_probe.generate_lfi_vector(url, param_name, lfi_result)
                         host.setdefault("attack_vectors", []).append(vector)
                         print(f"    [+] LFI CONFIRMED: {param_name}")
-                except Exception:
-                    pass
+                except Exception as e:
+                    swallow(__name__ + ":803", e)
 
     # CalDAV / Radicale enumeration for HTTPS or DAV-capable services
     if _HAS_CALDAV and (port == 443 or port == 80 or "caldav" in svc_name.lower()):
@@ -830,8 +830,8 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
                 # Generate CalDAV attack vectors
                 cal_vectors = caldav.generate_caldav_vectors(url, caldav_result)
                 host.setdefault("attack_vectors", []).extend(cal_vectors)
-        except Exception:
-            pass
+        except Exception as e:
+            swallow(__name__ + ":833", e)
 
     # API discovery
     api_result = web.api_enumerate(url)
@@ -1480,8 +1480,8 @@ def _run_cred_test(state: ReconState) -> List[str]:
                                     if cred_rec["username"] == username and cred_rec["password"] == password:
                                         if ip not in cred_rec["valid_on"]:
                                             cred_rec["valid_on"].append(ip)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            swallow(__name__ + ":1483", e)
                     # Test SSH
                     elif "ssh" in svc_name or port == 22:
                         try:
@@ -1494,8 +1494,8 @@ def _run_cred_test(state: ReconState) -> List[str]:
                                 f"(reused from {src_ip})"
                             )
                             client.close()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            swallow(__name__ + ":1497", e)
 
     # Phase 3: Authenticated web scanning on hosts where HTTP Basic worked
     for username, password, src_svc, src_ip in valid_creds:
@@ -1549,8 +1549,8 @@ def _authenticated_web_scan(url: str, username: str, password: str) -> List[str]
                         findings.append(
                             f"[!] {url}{path}: User/credential data visible behind auth!"
                         )
-            except Exception:
-                pass
+            except Exception as e:
+                swallow(__name__ + ":1552", e)
     except ImportError:
         pass
     return findings
@@ -2477,6 +2477,11 @@ def post_exploit_node(state: ReconState) -> ReconState:
 
 def pivot_node(state: ReconState) -> ReconState:
     """Discover and enumerate hosts in newly discovered internal networks.
+
+    NOT a duplicate of exploit_nodes.pivot_tunnel_node: this node (recon
+    graph) discovers+enumerates new subnets found during post-exploit;
+    pivot_tunnel_node (strike graph) establishes SOCKS tunnels through
+    compromised hosts. Both are intentionally in the workflow.
 
     This node runs after post_exploit discovers internal subnets. It:
     1. Identifies subnets that are accessible but not yet scanned

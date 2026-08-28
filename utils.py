@@ -105,8 +105,8 @@ def detect_listener_ip(interface: str = "tun0") -> str:
         )
         if result["stdout"]:
             return result["stdout"].split("\n")[0].strip()
-    except Exception:
-        pass
+    except Exception as e:
+        swallow(__name__ + ":108", e)
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("10.10.10.10", 80))
@@ -188,3 +188,17 @@ def http_post(
         )
     except Exception:
         return None
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Silent-exception helper (R6 hygiene)
+# ════════════════════════════════════════════════════════════════════════
+
+def swallow(context: str, exc: BaseException) -> None:
+    """Log swallowed exceptions when STRIKEARC_DEBUG=1, else stay quiet.
+
+    Replaces bare `except Exception: pass` — failures remain visible in
+    debug runs without cluttering normal operator output.
+    """
+    if os.environ.get("STRIKEARC_DEBUG"):
+        print(f"[debug] {context}: {exc.__class__.__name__}: {exc}", flush=True)

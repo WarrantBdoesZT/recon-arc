@@ -9,7 +9,7 @@ import re
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
-from utils import run_command, http_get, http_post, extract_emails
+from utils import run_command, http_get, http_post, extract_emails, swallow
 
 
 def directory_bust(
@@ -441,8 +441,8 @@ def vhost_bruteforce(
                         domain, size = result
                         discovered.append(domain)
                         print(f"    [+] Vhost: {domain} ({size}b)")
-                except Exception:
-                    pass
+                except Exception as e:
+                    swallow(__name__ + ":444", e)
     except Exception:
         # Timeout — we have what we have
         pass
@@ -588,8 +588,8 @@ def check_http_methods(url: str) -> dict:
         trace_resp = req.request("TRACE", url, timeout=5, verify=False)
         if trace_resp.status_code == 200 and "TRACE" in trace_resp.text:
             result["methods"].append("TRACE (active)")
-    except Exception:
-        pass
+    except Exception as e:
+        swallow(__name__ + ":591", e)
 
     # Test PUT
     try:
@@ -598,8 +598,8 @@ def check_http_methods(url: str) -> dict:
                                data="test", timeout=5, verify=False)
         if put_resp.status_code in (200, 201, 204):
             result["put_test"] = "PUT allowed — potential webshell upload"
-    except Exception:
-        pass
+    except Exception as e:
+        swallow(__name__ + ":601", e)
 
     return result
 

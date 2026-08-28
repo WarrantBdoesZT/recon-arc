@@ -9,6 +9,7 @@ import socket
 import ssl
 from typing import Dict, List, Optional
 from datetime import datetime
+from utils import swallow
 
 
 def extract_cert(host: str, port: int = 443, timeout: int = 5) -> Optional[dict]:
@@ -216,8 +217,8 @@ def analyze_cert_security(cert_info: dict) -> List[str]:
                     break
                 except ValueError:
                     continue
-    except Exception:
-        pass
+    except Exception as e:
+        swallow(__name__ + ":219", e)
 
     return findings
 
