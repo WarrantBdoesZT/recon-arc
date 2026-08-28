@@ -1597,6 +1597,14 @@ def analyze_node(state: ReconState) -> ReconState:
     all_findings = state.get("findings", [])[-200:]
     findings_text = "\n".join(all_findings[-100:])
 
+    # v8.2.1: handler-awareness for the prompt (run-13 lesson: LLM suggested
+    # an XSS step that no dispatcher could run — wasted iteration)
+    try:
+        from tools.exploit import HANDLED_VECTOR_TYPES
+        handled_types = ", ".join(sorted(HANDLED_VECTOR_TYPES))
+    except ImportError:
+        handled_types = "unknown (handler registry unavailable)"
+
     # Collect all attack vectors — DEDUP by ID
     all_vectors = []
     seen_ids = set()
@@ -1678,6 +1686,15 @@ Analyze ALL the above data and provide:
 3. **Privilege Escalation** paths for each potential foothold
 4. **Lateral Movement** opportunities
 5. **Missing Intelligence** — what else should be enumerated?
+
+## Hard Constraint — Exploit Handler Coverage
+Your attack paths are EXECUTED, not just admired: `_dispatch_attack_path`
+runs each step's commands verbatim, and vector dispatch only supports these
+types: {handled_types}.
+Do NOT suggest steps whose technique falls outside this set (e.g. pure
+client-side XSS, CSRF, clickjacking, social engineering — nothing runs
+them; a wasted suggestion = a wasted iteration). Credentials in state,
+nmap/gobuster/sqlmap/hydra/showmount/curl-style commands are all runnable.
 
 Return JSON with this structure:
 {{
