@@ -1874,7 +1874,7 @@ def scope_node(state: ReconState) -> ReconState:
 
     # Priority 3.3: Flag hunt on compromised hosts (StrikeARC)
     session_hosts = {s["host_ip"] for s in state.get("sessions", [])}
-    checked_hosts = {f["host_ip"] for f in state.get("flags_captured", [])}
+    checked_hosts = {f["host_ip"] for f in state.get("flags_captured", []) if isinstance(f, dict) and f.get("host_ip")}
     if session_hosts - checked_hosts:
         print(f"\n  → ACTION: Flag hunt on compromised hosts")
         return {**state, "current_phase": "flag_hunt"}
