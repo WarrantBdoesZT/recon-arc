@@ -502,8 +502,8 @@ def check_ftp_content(target_ip: str, port: int = 21) -> dict:
         import utils as _utils
         listener_ip = ""
         for detect_cmd in (
-            f"ip -4 route get {target_ip} 2>/dev/null | grep -oP 'src \\\\K[\\\\d.]+'",
-            "ip -4 addr show tun0 2>/dev/null | grep -oP 'inet \\\\K[\\\\d.]+'",
+            f"ip -4 route get {target_ip} 2>/dev/null | grep -oP 'src \\K[\\d.]+'",
+            "ip -4 addr show tun0 2>/dev/null | grep -oP 'inet \\K[\\d.]+'",
         ):
             try:
                 det_result = _utils.run_command(detect_cmd, timeout=3)
@@ -514,7 +514,10 @@ def check_ftp_content(target_ip: str, port: int = 21) -> dict:
             except Exception as e:
                 swallow(__name__ + ":514", e)
         if not listener_ip:
-            return None, "could not determine listener IP (no route to target)"
+            # never break the dict contract — keep old hardcoded-VPN behavior
+            # minus the hardcoded value: mark anonymous check failed.
+            info["raw"] = "could not determine listener IP (no route to target)"
+            return info
 
         # Test anonymous login + get banner
         banner_sock = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
