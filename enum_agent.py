@@ -230,6 +230,13 @@ Examples:
     )
     args = parser.parse_args()
 
+    # Preflight — surface missing external tooling before the engagement starts
+    try:
+        from tools.preflight import preflight_report
+        preflight_report(verbose=True)
+    except Exception as e:
+        print(f"[!] preflight skipped: {e}")
+
     print("=" * 60)
     print("  StrikeARC — Advanced Reconnaissance &")
     print("             Attack-path Ranking Console")
