@@ -848,6 +848,35 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
         new_findings.append(f"[ENUM] {url}: emails found: {', '.join(page_data['emails'])}")
         for email in page_data["emails"]:
             state.setdefault("_domain_users", []).append(email.split("@")[0])
+            # v8.2.2: keep the DOMAIN half too — it feeds vhost bruteforce
+            # and AXFR candidates (run-14 lesson: inlanefreight.local was
+            # harvested then discarded → 9 vhosts invisible for 4 runs)
+            mail_domain = email.split("@")[-1].lower().strip(".")
+            if "." in mail_domain and mail_domain not in (
+                "example.com", "localhost", "domain.com",
+            ):
+                state.setdefault("_discovered_domains", set()).add(mail_domain)
+                host.setdefault("_cert_domains", []).append(mail_domain)
+                # DNS enum ran BEFORE web enum on this host — retry AXFR
+                # now that we have a domain, while we're here
+                if _HAS_DNS and 53 in host.get("services", {}):
+                    import tools.dns_enum as dns_mod
+                    zt = dns_mod.zone_transfer(target, mail_domain)
+                    if zt and zt.get("records"):
+                        txt_vals = "; ".join(
+                            r.get("value", "")[:120]
+                            for r in zt["records"]
+                            if r.get("type") == "TXT"
+                        )[:300]
+                        new_findings.append(
+                            f"[!] AXFR success on {target} for {mail_domain}: "
+                            f"{len(zt['records'])} records. TXT: {txt_vals}"
+                        )
+                        for r in zt["records"]:
+                            if r.get("type") == "A" and r.get("name"):
+                                state.setdefault("_discovered_domains", set()).add(
+                                    f"{r['name']}.{mail_domain}".lstrip(".")
+                                )
     if page_data.get("comments"):
         for c in page_data["comments"][:3]:
             new_findings.append(f"[ENUM] {url}: HTML comment: {c[:80]}")

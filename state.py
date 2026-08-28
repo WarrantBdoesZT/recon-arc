@@ -488,6 +488,14 @@ def load_state(path: str) -> ReconState:
     path = os.path.expanduser(path)
     with open(path) as f:
         data = json.load(f)
+    # v8.2.2: save_state stringifies non-JSON values, so sets come back as
+    # repr-strings ("{'a', 'b'}"). Restore _discovered_domains to a real set
+    # — nodes call .add() on it, which would crash on a resumed save.
+    dd = data.get("_discovered_domains")
+    if isinstance(dd, str):
+        import re as _re
+        items = _re.findall(r"[A-Za-z0-9._-]+\.[A-Za-z]{2,}", dd)
+        data["_discovered_domains"] = set(items)
     return ReconState(**data)
 
 

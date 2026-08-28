@@ -433,6 +433,15 @@ def vhost_bruteforce(
     except FileNotFoundError:
         pass
 
+    # v8.2.2: with a discovered base domain, generate targeted candidates
+    # from the AXFR/email-derived domain (run-14: inlanefreight.local was
+    # known but only word.{htb,local,...} got tried → 9 vhosts missed)
+    discovered_bases = [d for d in (extra_domains or []) if "." in d]
+    for d in discovered_bases:
+        domains.add(d)
+        domains.add(f"www.{d}")
+        domains.add(f"mail.{d}")
+
     # Always check common vhosts
     common_vhosts = [
         "www", "admin", "mail", "dev", "test", "staging",
@@ -443,7 +452,45 @@ def vhost_bruteforce(
             domains.add(f"{prefix}.{suffix}")
 
     # Also try SSL-cert-derived names if available (set by caller)
-    candidates = sorted(domains)[:200]
+    # v8.2.2: rank by intelligence value, not alphabet. The old
+    # `sorted(domains)[:200]` cut let digit-entries (0.htb, 00.local, …)
+    # evict real candidates; naive prio still flooded the 200 cap with
+    # 4.6k wordlist cross-products. Host headers are case-insensitive,
+    # so normalize to lowercase and dedupe via the set.
+    domains = {d.lower() for d in domains}
+    if extra_domains:
+        tiers = [
+            # 1. the discovered domains themselves + common apex names
+            [d.lower() for d in extra_domains],
+            # 2. common vhost prefixes × discovered domains (targeted)
+            [f"{p}.{b.lower()}"
+             for b in extra_domains
+             for p in ("www", "admin", "mail", "dev", "test", "staging",
+                       "api", "vpn", "portal", "blog", "shop", "app",
+                       "git", "gitlab", "jenkins", "support", "intranet",
+                       "status", "tracking", "careers", "ir")],
+            # 3. everything else (wordlist cross-products, generic suffixes)
+            sorted(domains - {
+                d.lower() for d in extra_domains
+            } - {
+                f"{p}.{b.lower()}"
+                for b in extra_domains
+                for p in ("www", "admin", "mail", "dev", "test", "staging",
+                          "api", "vpn", "portal", "blog", "shop", "app",
+                          "git", "gitlab", "jenkins", "support", "intranet",
+                          "status", "tracking", "careers", "ir")
+            }),
+        ]
+        seen = set()
+        candidates = []
+        for tier in tiers:
+            for d in tier:
+                if d not in seen:
+                    seen.add(d)
+                    candidates.append(d)
+        candidates = candidates[:200]
+    else:
+        candidates = sorted(domains)[:200]
 
     # Get baseline
     start_time = time.time()
@@ -462,7 +509,9 @@ def vhost_bruteforce(
             f"http://{ip}", timeout=3, allow_redirects=False,
             headers={"Host": domain},
         )
-        if resp and resp.status_code == 200:
+        # v8.2.2: redirects (301/302) are also vhost evidence — GitLab's
+        # sign-in redirect was invisible to a 200-only check.
+        if resp and resp.status_code in (200, 301, 302):
             size = len(resp.text)
             if abs(size - baseline_size) > 100:
                 return (domain, size)
