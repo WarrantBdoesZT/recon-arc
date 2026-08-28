@@ -1620,6 +1620,35 @@ def analyze_node(state: ReconState) -> ReconState:
         state["attack_vectors"] = all_vectors
         return {**state, "current_phase": "scope", "iteration": state["iteration"] + 1}
 
+    # Vault knowledge pack — inject relevant HTB playbooks into LLM context
+    knowledge_text = ""
+    try:
+        from knowledge.retrieval import knowledge_pack, registry_stats
+        kstats = registry_stats()
+        if kstats.get("available"):
+            svc_set, tech_list, vt_set = set(), [], set()
+            for ip, host in state["hosts"].items():
+                for port_info in (host.get("ports") or {}).values():
+                    sname = (port_info or {}).get("service", "")
+                    if sname:
+                        svc_set.add(sname.split("|")[0].strip())
+                    prod = (port_info or {}).get("version", "")
+                    if prod:
+                        tech_list.append(prod)
+                for v in host.get("attack_vectors", []):
+                    vt_set.add(v.get("vector_type", ""))
+            pack = knowledge_pack(services=svc_set, technologies=tech_list,
+                                  vector_types=vt_set, phase="",
+                                  max_notes=10, max_chars=10000)
+            if pack:
+                knowledge_text = pack["text"]
+                state["knowledge_matches"] = pack["matches"]
+                print(f"  [+] Vault knowledge pack: {len(pack['matches'])} matched notes injected")
+        else:
+            print("  [i] Vault registry not built (knowledge/registry.json) — run knowledge/parse_vault.py")
+    except Exception as e:
+        print(f"  [!] Knowledge pack skipped: {e}")
+
     prompt = f"""You are a senior penetration tester analyzing enumeration results.
 Your task is to RANK attack vectors, identify the MOST LIKELY attack paths,
 and suggest exploitation strategies.
@@ -1632,6 +1661,9 @@ and suggest exploitation strategies.
 
 ## Discovered Attack Vectors (heuristic-generated)
 {vectors_text}
+
+## Relevant HTB Playbooks (operator's technique vault — proven commands)
+{knowledge_text}
 
 ## Your Task
 Analyze ALL the above data and provide:
