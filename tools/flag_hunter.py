@@ -104,10 +104,16 @@ FLAG_FILENAMES = [
 # ── Core Flag Hunting ─────────────────────────────────────────────────
 
 def _execute(transport, cmd: str, timeout: int = 10) -> Dict:
-    """Execute via transport or locally."""
+    """Execute via transport ONLY — never locally.
+
+    v8.4.0: the old `run_command(cmd)` fallback made the hunter search the
+    ATTACK BOX filesystem when no session transport existed (run-18 booked
+    a local test artifact /tmp/ftproot/flag.txt as a target 'root' flag).
+    Local fallback now returns empty output instead.
+    """
     if transport:
         return transport.run(cmd)
-    return run_command(cmd, timeout=timeout)
+    return {"stdout": "", "stderr": "", "blocked": "no-session-transport"}
 
 
 def hunt_linux_flags(transport=None) -> List[Dict]:
@@ -224,11 +230,14 @@ def hunt_linux_flags(transport=None) -> List[Dict]:
                         "method": "database",
                     })
 
-    # Deduplicate
+    # Deduplicate + validate (v8.4.0: only strict HTB{...} values count —
+    # blocks junk file contents and attack-box artifacts from booking)
     seen = set()
     unique_flags = []
     for f in flags:
         key = f["flag_value"]
+        if not re.fullmatch(r"HTB\{[^}\s]{4,}\}", key.strip()):
+            continue
         if key not in seen:
             seen.add(key)
             unique_flags.append(f)
@@ -292,11 +301,14 @@ def hunt_windows_flags(transport=None) -> List[Dict]:
                     "method": "registry_search",
                 })
 
-    # Deduplicate
+    # Deduplicate + validate (v8.4.0: only strict HTB{...} values count —
+    # blocks junk file contents and attack-box artifacts from booking)
     seen = set()
     unique_flags = []
     for f in flags:
         key = f["flag_value"]
+        if not re.fullmatch(r"HTB\{[^}\s]{4,}\}", key.strip()):
+            continue
         if key not in seen:
             seen.add(key)
             unique_flags.append(f)

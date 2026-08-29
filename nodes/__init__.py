@@ -1907,6 +1907,17 @@ def scope_node(state: ReconState) -> ReconState:
     # Priority 3.25: Exploit high-confidence attack vectors (StrikeARC)
     threshold = state.get("exploit_threshold", 70)
     attempted_ids = {a.get("vector_id", "") for a in state.get("exploit_attempts", [])}
+    # v8.4.0 failure memoization: LLM attack paths get FRESH ids every
+    # analyze pass, so attempted_ids can't stop identical re-dispatch
+    # (run 18 executed the same gitlab Host-header path twice; the stall
+    # descent re-offered dead vectors 17→1). Block (technique, target)
+    # pairs that already failed. Stable-id vectors (cred_spray_*) are
+    # unaffected — their ids are deterministic.
+    _failed_pairs = {
+        (a.get("technique", ""), a.get("target", ""))
+        for a in state.get("exploit_attempts", [])
+        if not a.get("success")
+    }
     # Merged view: global + per-host vectors (per-host is all that exists
     # before the first analyze run or when resuming from a save)
     _merged_vecs = list(state.get("attack_vectors", []))
@@ -1925,6 +1936,8 @@ def scope_node(state: ReconState) -> ReconState:
     for v in _merged_vecs:
         if v.get("score", 0) < threshold or v.get("id") in attempted_ids:
             continue
+        if (v.get("vector_type", "").lower(), v.get("target", "")) in _failed_pairs:
+            continue  # v8.4.0: identical (technique, target) already failed
         if HANDLED_VECTOR_TYPES is not None and v.get("vector_type", "").lower() not in HANDLED_VECTOR_TYPES:
             _skipped_unhandled += 1
             continue
@@ -2016,12 +2029,18 @@ def scope_node(state: ReconState) -> ReconState:
         # Check if there are any remaining unexploited vectors below the
         # current threshold before giving up entirely
         attempted_ids = {a.get("vector_id", "") for a in state.get("exploit_attempts", [])}
+        _failed_pairs_stall = {
+            (a.get("technique", ""), a.get("target", ""))
+            for a in state.get("exploit_attempts", [])
+            if not a.get("success")
+        }
         _merged_vecs = list(state.get("attack_vectors", []))
         for _h in state["hosts"].values():
             _merged_vecs.extend(_h.get("attack_vectors", []))
         remaining = [
             v for v in _merged_vecs
             if v.get("id") not in attempted_ids
+            and (v.get("vector_type", "").lower(), v.get("target", "")) not in _failed_pairs_stall
         ]
         if remaining:
             # Lower the threshold and try again
