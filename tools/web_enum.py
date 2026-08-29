@@ -42,7 +42,19 @@ def directory_bust(
         if cal.status_code == 200:
             wildcard = True
             baseline_size = len(cal.text or "")
-    except Exception:
+    except Exception as e:
+        # DEAD-HOST CIRCUIT BREAKER (v9.2, run-21 lesson): if calibration
+        # itself can't connect, the host is unreachable — running gobuster
+        # against it just burns ~10-20 min of timeout grinding per port.
+        # Bail out immediately; the enum walker will move to the next URL.
+        err = str(e)
+        if any(k in err for k in (
+            "No route to host", "Connection refused", "timed out",
+            "Max retries exceeded", "Name or service not known",
+            "Connection reset", "Unreachable",
+        )):
+            print(f"    [!] DEAD: {url} unreachable ({type(e).__name__}) — skipping bust")
+            return []
         wildcard = False
     if wildcard:
         print(f"    [!] WILDCARD: {url} returns 200 for random paths "
