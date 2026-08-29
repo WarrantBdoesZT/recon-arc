@@ -872,6 +872,26 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
                             f"[!] AXFR success on {target} for {mail_domain}: "
                             f"{len(zt['records'])} records. TXT: {txt_vals}"
                         )
+                        # v8.3.1: DNS TXT flags → flags_captured (run-15:
+                        # HTB{DNs_ZOn3_Tr@nsf3r} sat in findings, never
+                        # promoted — harvest→consumer gap, third instance)
+                        import re as _re_flag
+                        _existing = {f.get("flag_value") for f in state.get("flags_captured", []) if isinstance(f, dict)}
+                        for _r in zt["records"]:
+                            if _r.get("type") == "TXT":
+                                for _m in _re_flag.findall(r"(?:HTB|FLAG|CTF|DANTE)\{[^}]+\}", str(_r.get("value", ""))):
+                                    if _m not in _existing:
+                                        new_findings.append(f"[FLAG] 🚩 {_m} (DNS TXT record, {mail_domain})")
+                                        state["flags_captured"] = state.get("flags_captured", []) + [{
+                                            "host_ip": target,
+                                            "flag_type": "dns_txt",
+                                            "flag_value": _m,
+                                            "path": f"AXFR {mail_domain}",
+                                            "captured_at": __import__("time").strftime("%Y-%m-%dT%H:%M:%S"),
+                                            "method": "DNS zone transfer TXT record",
+                                        }]
+                                        state["flags_found_count"] = state.get("flags_found_count", 0) + 1
+                                        _existing.add(_m)
                         for r in zt["records"]:
                             if r.get("type") == "A" and r.get("name"):
                                 state.setdefault("_discovered_domains", set()).add(
@@ -1119,6 +1139,25 @@ def _enumerate_dns(state, host, target, new_findings):
                 f"[!] DNS zone transfer successful on {target} for {domain}! "
                 f"{len(zt['records'])} records"
             )
+            # v8.3.1: promote DNS TXT flags here too (this path fired on
+            # .153/.149 via LDAP-derived domain before web enum ran)
+            import re as _re_zt
+            _existing = {f.get("flag_value") for f in state.get("flags_captured", []) if isinstance(f, dict)}
+            for _r in zt["records"]:
+                if _r.get("type") == "TXT":
+                    for _m in _re_zt.findall(r"(?:HTB|FLAG|CTF|DANTE)\{[^}]+\}", str(_r.get("value", ""))):
+                        if _m not in _existing:
+                            new_findings.append(f"[FLAG] 🚩 {_m} (DNS TXT record, {domain})")
+                            state["flags_captured"] = state.get("flags_captured", []) + [{
+                                "host_ip": target,
+                                "flag_type": "dns_txt",
+                                "flag_value": _m,
+                                "path": f"AXFR {domain}",
+                                "captured_at": __import__("time").strftime("%Y-%m-%dT%H:%M:%S"),
+                                "method": "DNS zone transfer TXT record",
+                            }]
+                            state["flags_found_count"] = state.get("flags_found_count", 0) + 1
+                            _existing.add(_m)
 
     # DNS recursion check
     if dns.check_dns_recursion(target):
