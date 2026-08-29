@@ -51,6 +51,14 @@ class Playbook:
     triggers: List[str]   # keyword match against vector_type/evidence
 
     def matches(self, vector: Dict) -> bool:
+        # v9.2 (run-21 lesson): CVE vectors describe VERSIONS, not creds.
+        # 'openssh 8.9' in a CVE title substring-matched the 'ssh' trigger
+        # and mis-dispatched known_cve vectors to hydra sprays. CVE
+        # exploitation belongs to the v8 executor; playbooks never claim it.
+        if str(vector.get("vector_type", "")).lower() in (
+            "known_cve", "cve", "version_cve",
+        ):
+            return False
         hay = " ".join(
             str(vector.get(k, ""))
             for k in ("vector_type", "title", "description", "evidence", "target")
@@ -411,6 +419,12 @@ class CredSSHPlaybook(Playbook):
     def run(self, state: Dict, target: str) -> PlaybookResult:
         res = PlaybookResult("cred_ssh", target, "running")
         ip = extract_ip(target) or next(iter(state.get("hosts", {})), None)
+        if ip and ip.endswith(".0"):
+            # v9.2 (run-21 lesson): '10.129.145.0' is the network address,
+            # not a host — extract_ip or hosts-dict fallback produced it.
+            res.status = "skipped"
+            res.step(f"network address {ip} is not sprayable")
+            return res
         if not ip:
             res.status = "skipped"
             return res
