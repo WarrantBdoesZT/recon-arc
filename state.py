@@ -376,6 +376,7 @@ class ReconState(TypedDict):
     # Offensive operations state (v7)
     flags_captured: Annotated[List[FlagEntry], _dedup_by_value]
     exploit_attempts: Annotated[List[ExploitAttempt], _dedup_by_target_vector]
+    playbook_runs: Annotated[List[Dict], _dedup_by_id]  # v9: playbook execution log
     active_tunnels: Annotated[List[Tunnel], _dedup_by_id]
     privesc_results: Annotated[Dict[str, PrivescResult], lambda a, b: {**a, **b}]
     lateral_attempts: Annotated[List[LateralAttempt], _dedup_by_host_cred]
