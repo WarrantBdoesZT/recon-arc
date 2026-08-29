@@ -1283,13 +1283,16 @@ def _enumerate_extra_services(state, host, target, new_findings):
                 # Check downloaded file contents for flags/creds/intel
                 file_contents = ftp_info.get("file_contents", {})
                 for fname, content in file_contents.items():
-                    new_findings.append(f"[FTP] Contents of {fname}:")
+                    # v8.3.3: host-tag every line — run-15 saw .153 and .149
+                    # both produce "[FTP] Contents of flag.txt:"; _dedup would
+                    # silently drop the second host's identical findings.
+                    new_findings.append(f"[FTP] {target}:{port} contents of {fname}:")
                     # Scan for flags
                     import re as _re
                     for pattern in [r'DANTE\{[^}]+\}', r'FLAG\{[^}]+\}', r'HTB\{[^}]+\}']:
                         flags = _re.findall(pattern, content)
                         for flag in flags:
-                            new_findings.append(f"[FLAG] 🚩 {flag} (from FTP: {fname})")
+                            new_findings.append(f"[FLAG] 🚩 {flag} (from FTP {target}: {fname})")
                             state["flags_captured"] = state.get("flags_captured", []) + [{
                                 "host_ip": target,
                                 "flag_type": "ftp",
@@ -1977,6 +1980,39 @@ def scope_node(state: ReconState) -> ReconState:
     state["last_findings_len"] = findings_len
 
     if state.get("stall_count", 0) >= 1:
+        # Priority 4.5: Lab-death detection (run-15 gap: lab expired ~2h in;
+        # the agent ground through ~40 more iterations / 159 connection-failed
+        # cred tests / 28 doomed exploits against hosts that were all down).
+        # On every stall, probe up to 5 hosts on ports we KNOW were open.
+        # If none respond, the environment is gone — no vector can succeed.
+        probe_targets = []
+        for ip, h in list(state["hosts"].items())[:5]:
+            # NB: after save/load (JSON), services keys are digit STRINGS —
+            # accept both int and str forms.
+            ports = [int(p) for p in (h.get("services") or {}).keys()
+                     if isinstance(p, int) or (isinstance(p, str) and p.isdigit())]
+            if ip and ports:
+                probe_targets.append((ip, ports[0]))
+        alive = 0
+        for ip, port in probe_targets:
+            try:
+                import socket as _probe_sock
+                _p = _probe_sock.socket(_probe_sock.AF_INET, _probe_sock.SOCK_STREAM)
+                _p.settimeout(3)
+                _p.connect((ip, port))
+                alive += 1
+                _p.close()
+            except ConnectionRefusedError:
+                alive += 1  # refused = host is up, service died
+            except Exception:
+                pass
+        if probe_targets and alive == 0:
+            print(f"\n  [!] Environment unreachable: probed {len(probe_targets)} known-open"
+                  f" ports, 0 responded.")
+            print("      (Lab expired or VPN dropped — remaining vectors cannot succeed.)")
+            print("  [*] Generating report instead of spinning against dead targets.")
+            return {**state, "current_phase": "report"}
+
         # Check if there are any remaining unexploited vectors below the
         # current threshold before giving up entirely
         attempted_ids = {a.get("vector_id", "") for a in state.get("exploit_attempts", [])}

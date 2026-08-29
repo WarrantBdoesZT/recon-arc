@@ -478,6 +478,10 @@ def check_ftp_content(target_ip: str, port: int = 21) -> dict:
 
             try:
                 conn, _ = s_data.accept()
+                conn.settimeout(10)  # accepted sockets don't inherit the
+                # listener timeout — without this a server that accepts the
+                # data conn but never sends (e.g. pyftpdlib on 550 LIST)
+                # blocks recv() forever and hangs the whole enumeration.
                 data = b""
                 while True:
                     chunk = conn.recv(4096)
@@ -535,6 +539,22 @@ def check_ftp_content(target_ip: str, port: int = 21) -> dict:
             info["anonymous"] = True
             print(f"    [+] ENUM: FTP ANONYMOUS login succeeded")
 
+            def _retr(remote_path: str):
+                """RETR with retry + explicit failure log (run-15 gap: .153
+                flag.txt was LISTed but a single RETR returned empty — flag
+                silently lost while .149's identical flow succeeded)."""
+                import time as _time
+                for _attempt in range(3):
+                    content, _err = _ftp_cmd(
+                        f"RETR {remote_path}", collect_data=True,
+                        listener_ip=listener_ip)
+                    if content and "AUTH FAILED" not in content:
+                        return content
+                    _time.sleep(0.5 * (_attempt + 1))
+                print(f"    [!] FTP: RETR {remote_path} failed after 3 "
+                      f"attempts (listed but undownloadable)")
+                return None
+
             # List root directory using active mode
             root_listing, err = _ftp_cmd("LIST", collect_data=True, listener_ip=listener_ip)
             if root_listing and root_listing != "AUTH FAILED":
@@ -548,8 +568,8 @@ def check_ftp_content(target_ip: str, port: int = 21) -> dict:
 
                             # Download root text files (check for flags/creds)
                             if any(fname.endswith(ext) for ext in ['.txt', '.cfg', '.conf', '.md', '.json', '.csv']):
-                                content, _ = _ftp_cmd(f"RETR {fname}", collect_data=True, listener_ip=listener_ip)
-                                if content and "AUTH FAILED" not in content and len(content) < 10000:
+                                content = _retr(fname)
+                                if content and len(content) < 10000:
                                     info["file_contents"][fname] = content
 
             # Explore common + Dante-specific directories
@@ -567,7 +587,7 @@ def check_ftp_content(target_ip: str, port: int = 21) -> dict:
 
                                 # Download text files (check for flags/creds)
                                 if any(fname.endswith(ext) for ext in ['.txt', '.cfg', '.conf', '.md', '.json', '.csv']):
-                                    content, _ = _ftp_cmd(f"RETR {dirname}/{fname}", collect_data=True, listener_ip=listener_ip)
+                                    content = _retr(f"{dirname}/{fname}")
                                     if content and len(content) < 10000:
                                         info["file_contents"][full_path] = content
 
