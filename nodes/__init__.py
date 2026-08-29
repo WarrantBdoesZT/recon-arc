@@ -1478,6 +1478,28 @@ def _run_cred_test(state: ReconState) -> List[str]:
                         "source_service": r["service"],
                         "valid_on": [ip],
                     })
+                    # v8.3.0 (vault PA-06/07): a validated cred immediately
+                    # earns a fleet-spray vector. The old agent validated
+                    # admin:admin on .72 then NEVER sprayed the Windows
+                    # fleet — the single biggest missed prolab move.
+                    _sv = state.setdefault("attack_vectors", [])
+                    if not any(v.get("id") == f"cred_spray_{r['username']}" for v in _sv):
+                        _sv.append(AttackVector(
+                            id=f"cred_spray_{r['username']}",
+                            target="fleet",
+                            category="credential_attack",
+                            vector_type="password_spray",
+                            title=f"Fleet spray: {r['username']} (validated on {ip})",
+                            description=(f"Spray validated {r['username']} credential "
+                                         f"across SMB/WinRM/SSH/web forms fleet-wide "
+                                         f"(vault: Password Attacks 06/07)"),
+                            confidence="high",
+                            score=85,
+                            evidence=[f"validated on {ip} as {r['service']}"],
+                            exploit_suggestions=["netexec smb", "sshpass", "form POST"],
+                            prerequisites=[], cves=[], references=[],
+                        ))
+                        print(f"  [+] Queued fleet-spray vector for {r['username']} (score 85)")
                 else:
                     findings.append(
                         f"[CRED] ✗ {r['service']} on {ip} — "
