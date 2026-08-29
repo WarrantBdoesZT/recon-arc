@@ -1566,12 +1566,21 @@ def _run_cred_test(state: ReconState) -> List[str]:
                         url = f"{scheme}://{ip}:{port}"
                         try:
                             import requests as _req
+                            # v9.1: HTTP 200 alone is NOT validation. Basic auth is
+                            # only bookable when the app actually challenged us
+                            # (401 + WWW-Authenticate) and then accepted the creds.
+                            # A form-login app ignores Basic auth and serves its
+                            # public page with 200 → run-20 false positive.
+                            anon = _req.get(url, timeout=5, verify=False, allow_redirects=False)
+                            challenged = anon.status_code == 401 and "www-authenticate" in {k.lower() for k in anon.headers}
+                            if not challenged:
+                                continue
                             r = _req.get(url, auth=(username, password),
                                         timeout=5, verify=False, allow_redirects=False)
                             if r.status_code == 200:
                                 findings.append(
                                     f"[CRED-REUSE] ✓ {username}:{password} works on {url} "
-                                    f"(HTTP 200 — reused from {src_ip})"
+                                    f"(Basic auth challenge accepted — reused from {src_ip})"
                                 )
                                 # Update credential record
                                 for cred_rec in state.get("discovered_credentials", []):

