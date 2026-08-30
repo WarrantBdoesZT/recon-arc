@@ -1348,6 +1348,60 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
             _n = vh["name"] if isinstance(vh, dict) else vh
             new_findings.append(f"[ENUM] {target}: Vhost discovered: {_n}")
 
+        # v10.4.4 DIRECTORY→VHOST PROMOTION — run-22 live-catch: /monitoring
+        # was a 301 in the :80 directory bust but nothing promoted it to a
+        # Host-header probe, and the brute's alphabetical cap evicted
+        # monitoring.inlanefreight.local. Any bust-found directory that
+        # isn't a generic asset dir becomes a targeted vhost candidate
+        # against every discovered base domain. Wordlist-independent.
+        try:
+            _GENERIC_DIRS = {
+                "css", "js", "img", "images", "fonts", "ico", "icon", "icons",
+                "static", "assets", "media", "javascript", "style", "styles",
+                "dist", "build", "vendor", "doc", "docs", "documentation",
+            }
+            _bases = sorted({
+                str(d).strip().lower().split("->")[0].strip()
+                for d in (vhost_domains or [])
+                if d and "." in str(d)
+            })
+            _have = {vh["name"].lower() for vh in host.get("vhosts", [])
+                     if isinstance(vh, dict)}
+            _promoted = 0
+            for wa in host.get("web_apps", []):
+                if not isinstance(wa, dict):
+                    continue
+                if str(wa.get("url", "")).startswith("https"):
+                    continue
+                for d in (wa.get("directories") or []):
+                    p = str(d.get("path", "")).strip().strip("/")
+                    if not p or "/" in p or "." in p:
+                        continue
+                    if p.lower() in _GENERIC_DIRS or p.lower() in _have:
+                        continue
+                    for b in _bases:
+                        cand = f"{p}.{b}"
+                        if cand in _have:
+                            break
+                        vh = web.probe_vhost(target, cand, port=port, scheme=scheme)
+                        if vh:
+                            host.setdefault("vhosts", []).append(vh)
+                            _have.add(vh["name"].lower())
+                            new_findings.append(
+                                f"[ENUM] {target}: Vhost promoted from directory "
+                                f"'/{p}': {vh['name']} ({vh['status']}, {vh['size']}b)"
+                            )
+                            print(f"    [+] Vhost (dir-promoted): {vh['name']} "
+                                  f"({vh['size']}b{', ' + repr(vh['title']) if vh['title'] else ''})")
+                            _promoted += 1
+                        break   # one base domain is enough per dir name
+                    if _promoted >= 10:
+                        break
+                if _promoted >= 10:
+                    break
+        except Exception as e:
+            swallow(__name__ + ":dir2vhost", e)
+
     # v10.2 RECURSIVE vhost enumeration: each named vhost gets its own
     # fingerprint + directory bust (Host-header override) + config check +
     # one-level subdirectory recursion. Budget-capped so a 9-vhost shared IP

@@ -446,6 +446,11 @@ def vhost_bruteforce(
     v10.4.3: default wordlist is now a real DNS list (bitquark-100k,
     frequency-ranked), candidate cap 200→3000, max_time 30→150 — the old
     dirb/common.txt ×6-suffix ×200-cap combo missed real vhosts.
+    v10.4.4: tier 2.5 — every wordlist word under DISCOVERED domains, in
+    wordlist (frequency) order, ahead of generic-suffix junk. Run-22
+    live-catch: alphabetical tier-3 sort let digit junk (0.htb..499.*)
+    fill the entire cap; monitoring.inlanefreight.local (bitquark rank
+    #633, position 15,384/20,986) was never probed.
     """
     import time
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -465,13 +470,15 @@ def vhost_bruteforce(
         for d in extra_domains:
             base_domains.append(d)
 
+    _wl_words: List[str] = []
     try:
         with open(wordlist) as f:
             for i, line in enumerate(f):
                 if i > 3000:     # v10.4.3: was 500-word cap — too shallow
                     break
-                word = line.strip()
+                word = line.strip().lower()
                 if word:
+                    _wl_words.append(word)   # v10.4.4: order preserved for tier 2.5
                     for suffix in base_domains:
                         domains.add(f"{word}.{suffix}")
     except FileNotFoundError:
@@ -502,23 +509,39 @@ def vhost_bruteforce(
     # 4.6k wordlist cross-products. Host headers are case-insensitive,
     # so normalize to lowercase and dedupe via the set.
     domains = {d.lower() for d in domains}
-    if extra_domains:
+    # v10.4.4: sanitize extra_domains — DNS-found subdomains arrive here as
+    # raw dig output ("tracking.inlanefreight.local -> 127.0.0.1"); the arrow
+    # suffix would generate garbage Host headers that can never match.
+    _clean_extra = [
+        str(d).strip().lower().split("->")[0].strip()
+        for d in (extra_domains or [])
+        if d and str(d).strip()
+    ]
+    _clean_extra = [d for d in _clean_extra if d]
+    if _clean_extra:
         tiers = [
             # 1. the discovered domains themselves + common apex names
-            [d.lower() for d in extra_domains],
+            _clean_extra,
             # 2. common vhost prefixes × discovered domains (targeted)
-            [f"{p}.{b.lower()}"
-             for b in extra_domains
+            [f"{p}.{b}"
+             for b in _clean_extra
              for p in ("www", "admin", "mail", "dev", "test", "staging",
                        "api", "vpn", "portal", "blog", "shop", "app",
                        "git", "gitlab", "jenkins", "support", "intranet",
                        "status", "tracking", "careers", "ir")],
+            # 2.5 v10.4.4: EVERY wordlist word × discovered domains, in
+            # wordlist (frequency) order — the run-22 fix. Previously these
+            # landed in alphabetically-sorted tier 3 behind ~15k digit-junk
+            # cross-products (0.htb…499.*) and were evicted by the 3000 cap
+            # before ever being probed. monitoring.inlanefreight.local
+            # (bitquark #633) sat at position 15,384.
+            [f"{w}.{b}" for b in _clean_extra for w in _wl_words],
             # 3. everything else (wordlist cross-products, generic suffixes)
             sorted(domains - {
-                d.lower() for d in extra_domains
+                d for d in _clean_extra
             } - {
-                f"{p}.{b.lower()}"
-                for b in extra_domains
+                f"{p}.{b}"
+                for b in _clean_extra
                 for p in ("www", "admin", "mail", "dev", "test", "staging",
                           "api", "vpn", "portal", "blog", "shop", "app",
                           "git", "gitlab", "jenkins", "support", "intranet",
@@ -601,6 +624,53 @@ def vhost_bruteforce(
         pass
 
     return discovered
+
+
+def probe_vhost(
+    ip: str,
+    name: str,
+    port: int = 80,
+    scheme: str = "http",
+) -> Optional[dict]:
+    """Probe a single Host-header override and decide if it's a distinct vhost.
+
+    v10.4.4 companion to the tier-2.5 candidate fix: lets callers promote
+    leads (e.g. directory names found during busting) into targeted vhost
+    checks WITHOUT a wordlist. Reuses the same distinctness rule as
+    vhost_bruteforce (size-diff > 100b, title-diff, or status-diff vs the
+    IP-Host baseline), so a promoted name is judged identically to a
+    wordlist candidate. Returns the vhost dict on hit, None otherwise.
+    """
+    import re as _re
+
+    def _title_of(text: str) -> str:
+        m = _re.search(r"<title>(.*?)</title>", text or "", _re.I)
+        return m.group(1).strip()[:60] if m else ""
+
+    base = http_get(f"{scheme}://{ip}:{port}", timeout=5, allow_redirects=False,
+                    headers={"Host": ip})
+    if base is None:
+        return None
+    base_size, base_status = len(base.text or ""), base.status_code
+    base_title = _title_of(base.text)
+
+    resp = http_get(f"{scheme}://{ip}:{port}", timeout=5, allow_redirects=False,
+                    headers={"Host": name})
+    if resp is None:
+        return None
+    size, title = len(resp.text or ""), _title_of(resp.text)
+    distinct = (
+        abs(size - base_size) > 100
+        or (title and title != base_title)
+        or (200 <= resp.status_code < 400 and resp.status_code != base_status)
+    )
+    if distinct:
+        return {
+            "name": name, "port": port, "scheme": scheme,
+            "title": title, "status": resp.status_code, "size": size,
+            "source": "probe_vhost",
+        }
+    return None
 
 
 # ── Advanced Web Enumeration ───────────────────────────────────────────
