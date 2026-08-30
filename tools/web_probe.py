@@ -431,8 +431,10 @@ def probe_cms_paths(s, app, out, stats):
     """CMS/app-specific path probing (Common Applications/*): probe the
     canonical enum paths for whatever the fingerprint says."""
     # v10.4.3: match on tech AND label — a vhost named support.inlanefreight
-    # has osTicket paths even when its fingerprint is just "PHP/Bootstrap"
-    t = (" ".join(app.tech) + " " + app.host_header + " " + app.label).lower()
+    # has osTicket paths even when its fingerprint is just "PHP/Bootstrap".
+    # v10.4.3d: host_header is None for IP surfaces — None-guard or the
+    # concatenation TypeErrors and kills ALL cms checks on default sites.
+    t = (" ".join(app.tech) + " " + (app.host_header or "") + " " + app.label).lower()
     checks: List[Tuple[str, str, str]] = []      # (path, finding, vault note)
     if "wordpress" in t:
         # NB: wp-links-opml.php NOT in vault (verified) — standard WP enum
@@ -681,10 +683,12 @@ def surfaces_from_host(host: dict, target: str) -> List[AppSurface]:
         return int(port) in web_ports or any(
             k in name for k in ("http", "www", "ssl/https", "https"))
 
-    apps_by_url = {a.get("url", ""): a for a in host.get("web_apps", [])}
+    # v10.4.3d: web_apps URL keys are inconsistent (IP ports stored without
+    # trailing slash, vhosts with) — normalize or IP surfaces run techless.
+    apps_by_url = {a.get("url", "").rstrip("/"): a for a in host.get("web_apps", [])}
     for port, scheme in _web_ports():
         base = f"{scheme}://{target}:{port}/"
-        wa = apps_by_url.get(base) or {}
+        wa = apps_by_url.get(base.rstrip("/")) or {}
         surfaces.append(AppSurface(
             url=base, host_header=None, label=f"{target}:{port}",
             tech=wa.get("technologies") or [],
@@ -699,7 +703,7 @@ def surfaces_from_host(host: dict, target: str) -> List[AppSurface]:
         scheme = (vh.get("scheme", "http") if isinstance(vh, dict) else "http")
         vh_url = f"{scheme}://{name}:{port}/"
         ip_base = f"{scheme}://{target}:{port}/"
-        wa = apps_by_url.get(vh_url) or {}
+        wa = apps_by_url.get(vh_url.rstrip("/")) or {}
         surfaces.append(AppSurface(
             url=ip_base, host_header=name, label=f"{name}:{port}",
             tech=wa.get("technologies") or [],
