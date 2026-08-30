@@ -18,6 +18,7 @@ def directory_bust(
     wordlist: str = "/usr/share/wordlists/dirb/common.txt",
     extensions: str = "php,html,txt,bak,old,json,xml,yml,yaml,env,git",
     timeout: int = 120,
+    host_header: Optional[str] = None,
 ) -> List[dict]:
     """Directory enumeration using gobuster.
 
@@ -27,6 +28,9 @@ def directory_bust(
     host (5.7 MB each). Now a random nonexistent path is baselined
     first; if it 200s, the service is marked wildcard and only paths
     whose size DIFFERS from the wildcard baseline are kept.
+
+    v10.2: host_header — bust a NAMED VHOST on a shared IP (gobuster -H
+    "Host: name"). The URL stays the IP so no local DNS is needed.
     """
     parsed = urlparse(url)
     host = parsed.hostname or url
@@ -37,8 +41,10 @@ def directory_bust(
     try:
         import requests as _rq
         probe_url = f"{parsed.scheme}://{parsed.netloc}/{uuid.uuid4().hex}{uuid.uuid4().hex}"
-        cal = _rq.get(probe_url, timeout=8, verify=False,
-                      headers={"User-Agent": "StrikeARC"})
+        _cal_headers = {"User-Agent": "StrikeARC"}
+        if host_header:
+            _cal_headers["Host"] = host_header  # baseline THIS vhost, not default
+        cal = _rq.get(probe_url, timeout=8, verify=False, headers=_cal_headers)
         if cal.status_code == 200:
             wildcard = True
             baseline_size = len(cal.text or "")
@@ -65,6 +71,8 @@ def directory_bust(
         f"-x '{extensions}' -t 30 -k --no-error "
         f"-b 404 -o /dev/stdout 2>/dev/null"
     )
+    if host_header:
+        cmd += f" -H 'Host: {host_header}'"
     result = run_command(cmd, timeout=timeout)
 
     dirs = []
@@ -268,8 +276,9 @@ def fingerprint_tech(url: str) -> dict:
     }
 
 
-def check_config_files(url: str) -> List[dict]:
-    """Check for exposed configuration and backup files."""
+def check_config_files(url: str, host_header: Optional[str] = None) -> List[dict]:
+    """Check for exposed configuration and backup files.
+    v10.2: host_header — probe a named vhost on a shared IP."""
     findings = []
     config_paths = [
         "/.env", "/config.php", "/configuration.php", "/wp-config.php",
@@ -290,7 +299,8 @@ def check_config_files(url: str) -> List[dict]:
 
     for path in config_paths:
         test_url = urljoin(url, path)
-        resp = http_get(test_url, timeout=5, allow_redirects=False)
+        _hh = {"Host": host_header} if host_header else None
+        resp = http_get(test_url, timeout=5, allow_redirects=False, headers=_hh)
         if resp and resp.status_code == 200 and len(resp.text) > 10:
             # Don't report empty or default pages
             content_preview = resp.text[:200].lower()
@@ -567,13 +577,16 @@ def recursive_directory_bust(
 
     dirs = directory_bust(url, wordlist=wordlist)
 
+    seen_paths = {d.get("path") for d in (found_dirs or [])}
+
     for d in dirs:
         found_dirs.append(d)
         # Recurse into directories (not files)
         path = d["path"]
         if d["status"] in (200, 301, 302, 401, 403) and "." not in path.rsplit("/", 1)[-1]:
             subdir_url = f"{url}{path}" + ("" if path.endswith("/") else "/")
-            if subdir_url not in str(found_dirs):  # avoid infinite loops
+            # v10: fix loop-guard — compare paths, not str(list-of-dicts)
+            if subdir_url.rstrip("/") not in {(p or "").rstrip("/") for p in seen_paths}:
                 recursive_directory_bust(
                     subdir_url, wordlist, max_depth, found_dirs, _depth + 1,
                 )

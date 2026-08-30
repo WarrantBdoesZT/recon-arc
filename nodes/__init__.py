@@ -185,7 +185,7 @@ def enumerate_node(state: ReconState) -> ReconState:
 
     host = state["hosts"][target]
     print("\n" + "=" * 60)
-    print(f"  PHASE: ENUMERATION — {target} ({host['os']})")
+    print(f"  PHASE: ENUMERATION — {target} ({host.get('os', '?')})")
     print("=" * 60)
 
     new_findings = []
@@ -209,6 +209,67 @@ def enumerate_node(state: ReconState) -> ReconState:
     }
 
 
+_MAIL_TLS_PORTS = {993, 995, 465, 587}
+_WEB_PORTS = {80, 443, 8000, 8080, 8443, 5000, 3000, 8888}
+
+
+def _is_web_service(svc_name: str, port) -> bool:
+    """v10: canonical web-service test. nmap labels imaps/pop3s/smtps as
+    'ssl' — the old `ssl in name` match treated Dovecot 993/995 as web and
+    gobuster'd/nuclei'd an IMAP server (~2min each, bogus XSS vectors)."""
+    svc_name = (svc_name or "").lower()
+    port = int(port)
+    if port in _MAIL_TLS_PORTS:
+        return False
+    if "http" in svc_name or "https" in svc_name or "http-alt" in svc_name:
+        return True
+    if "ssl" in svc_name and port not in _MAIL_TLS_PORTS:
+        return True
+    return port in _WEB_PORTS
+
+
+def _recursive_work_pending(state) -> bool:
+    """v10.2: is there recursive enumeration work left? Used to override the
+    stall-exit so discovered vhosts/promoted hosts actually get enumerated."""
+    for ip, h in state.get("hosts", {}).items():
+        if not isinstance(h, dict):
+            continue
+        # vhosts discovered but never deep-enumerated
+        if h.get("vhosts") and not h.get("vhost_enum_done"):
+            return True
+        # DNS-promoted hosts never picked up (created with services={})
+        if h.get("discovered_via", "").startswith("DNS:") and not h.get("services"):
+            return True
+    return False
+
+
+def _promote_dns_targets(state, dns_server, subs, new_findings):
+    """v10: DNS-discovered hostnames often resolve to NEW IPs — promote them
+    into scan scope so the walker enumerates them next iteration."""
+    try:
+        from tools.dns_enum import resolve_and_promote
+        known = set(state.get("hosts", {}).keys())
+        known.add(dns_server)
+        for hit in resolve_and_promote(subs, dns_server, known)[:15]:
+            ip, via = hit["ip"], hit["via"]
+            if ip not in state.get("hosts", {}):
+                state["hosts"][ip] = {
+                    "ip": ip,
+                    "alive": True,
+                    "discovered_via": f"DNS: {via} (via {dns_server})",
+                    "services": {},
+                    "enum_depth": 0,
+                    "enumerated": False,
+                }
+                state.setdefault("pending_targets", []).append(ip)
+                new_findings.append(
+                    f"[SCOPE+] {ip} — new target via DNS ({via}); queued for enumeration"
+                )
+    except Exception as e:
+        from utils import swallow
+        swallow(__name__ + ":promote_dns", e)
+
+
 def _enumerate_host(state, host, target, new_findings):
     """Full deep enumeration of a host: ports, services, web, AD, DNS, SNMP."""
     quick_mode = state.get("quick_mode", False)
@@ -229,7 +290,7 @@ def _enumerate_host(state, host, target, new_findings):
         # For each web service, do targeted enumeration
         for port, svc in host["services"].items():
             svc_name = svc.get("service", "").lower()
-            if "http" not in svc_name and "ssl" not in svc_name:
+            if not _is_web_service(svc_name, port):
                 continue
 
             scheme = "https" if ("ssl" in svc_name or port in (443, 8443)) else "http"
@@ -366,7 +427,7 @@ def _enumerate_host(state, host, target, new_findings):
     # SSL certificate intel — enhanced with ssl_enum module
     cert_domains = []  # Track domains discovered from SSL certs
     for port, svc in host["services"].items():
-        if "ssl" in svc["service"].lower() or "https" in svc["service"].lower() or port == 443:
+        if _is_web_service(svc["service"], port):
             if _HAS_SSL_ENUM:
                 try:
                     cert_info = ssl_enum.extract_cert(target, port)
@@ -422,6 +483,8 @@ def _enumerate_host(state, host, target, new_findings):
                                         )
                                         for sub in subs[:5]:
                                             state.setdefault("_discovered_domains", set()).add(sub)
+                                        # v10: resolve finds → promote new IPs into scope
+                                        _promote_dns_targets(state, target, subs, new_findings)
                                 except Exception as e:
                                     swallow(__name__ + ":425", e)
                 except Exception as e:
@@ -457,13 +520,13 @@ def _enumerate_host(state, host, target, new_findings):
     # Web enumeration
     for port, svc in host["services"].items():
         svc_name = svc["service"].lower()
-        if "http" in svc_name or "ssl" in svc_name or "https" in svc_name:
+        if _is_web_service(svc_name, port):
             _enumerate_web(state, host, target, port, svc, new_findings)
 
     # Nuclei scan on web services
     for port, svc in host["services"].items():
         svc_name = svc["service"].lower()
-        if "http" in svc_name or "ssl" in svc_name or "https" in svc_name:
+        if _is_web_service(svc_name, port):
             scheme = "https" if ("ssl" in svc_name or "https" in svc_name or port == 443) else "http"
             use_ssl = scheme == "https"
             nuclei_results = recon.nuclei_scan(target, port, use_ssl=use_ssl)
@@ -487,6 +550,171 @@ def _enumerate_host(state, host, target, new_findings):
     # Database/service checks
     if _HAS_EXTRA:
         _enumerate_extra_services(state, host, target, new_findings)
+
+    # ── Coverage engine + evidence capture (aquatone sweep + snapshots) ─────
+    _coverage_and_evidence(state, host, target, new_findings)
+
+
+def _coverage_and_evidence(state, host, target, new_findings):
+    """Post-enumeration hook: rebuild vault coverage checklist and capture
+    web evidence (aquatone screenshots, titles, tech tags) for this host."""
+    try:
+        from knowledge.coverage import build_coverage, coverage_stats
+        state["coverage"] = build_coverage(state)
+        stats = coverage_stats(state["coverage"])
+        print(f"  [COV] vault coverage: {stats['done']}/{stats['enum_safe']} enum-safe done, "
+              f"{stats['manual_leads']} manual leads tracked")
+    except Exception as exc:  # coverage must never break enumeration
+        print(f"  [COV] coverage build failed (non-fatal): {exc}")
+
+    # Aquatone sweep across every web service on this host
+    web_urls = []
+    for port, svc in (host.get("services") or {}).items():
+        name = (svc.get("service") or "").lower()
+        if _is_web_service(name, port):
+            scheme = "https" if ("ssl" in name or int(port) in (443, 8443)) else "http"
+            web_urls.append(f"{scheme}://{target}:{port}/")
+    if not web_urls:
+        return
+    try:
+        from tools.evidence import EvidenceStore
+        ev = _get_evidence_store(state)
+        pages = ev.sweep_urls(web_urls)
+        state["evidence_web"] = state.get("evidence_web", []) + pages
+        for page in pages:
+            tags = ", ".join(page.get("tags", [])[:5]) or "no-tags"
+            shot = "📷" if page.get("screenshot") else "·"
+            new_findings.append(
+                f"[ENUM] {page['url']} — '{page.get('title','?')}' [{page.get('status','?')}] "
+                f"{shot} tech: {tags}")
+            if page.get("tags"):
+                # enrich web_apps tech lists via aquatone fingerprints
+                for wa in host.get("web_apps", []):
+                    if wa.get("url", "").rstrip("/") == page["url"].rstrip("/"):
+                        merged = list(wa.get("technologies") or [])
+                        for t in page["tags"]:
+                            if t not in merged:
+                                merged.append(t)
+                        wa["technologies"] = merged
+
+        # v10: vhost screenshots — aquatone can't send Host headers, so shoot
+        # discovered vhosts individually with Chrome --host-resolver-rules
+        _shoot_vhosts(state, host, target, ev, new_findings)
+    except Exception as exc:
+        print(f"  [EV] evidence sweep failed (non-fatal): {exc}")
+
+
+def _shoot_vhosts(state, host, target, ev, new_findings):
+    """Screenshot discovered vhosts via Chrome --host-resolver-rules mapping."""
+    vhosts = host.get("vhosts") or []
+    if not vhosts:
+        return
+    ports_by_scheme = [
+        (p, "https" if ("ssl" in ((host["services"].get(p, {}) or {}).get("service", "") or "").lower() or int(p) in (443, 8443)) else "http")
+        for p, s in (host.get("services") or {}).items()
+        if _is_web_service((s.get("service") or "").lower(), p)
+    ]
+    for vh in vhosts[:8]:
+        name = vh if isinstance(vh, str) else vh.get("name", "")
+        if not name or "." not in name:
+            continue
+        for p, scheme in ports_by_scheme[:2]:
+            shot = ev.screenshot_vhost(name, target, int(p), scheme=scheme)
+            if shot:
+                new_findings.append(f"[ENUM] vhost 📷 {name}:{p} → {shot}")
+                break
+
+
+def _enumerate_vhost(state, host, target, port, scheme, vh_name, new_findings, depth=0):
+    """v10.2 RECURSIVE enumeration of one named vhost on a shared IP.
+
+    Everything goes over the IP URL with an explicit Host header (no local
+    DNS needed): fingerprint → forms → directory bust → config files → JS
+    analysis. Any interesting subdirectories found are recursed into ONE
+    more level (depth-capped at 1 to bound total work).
+    """
+    ip_url = f"{scheme}://{target}:{port}"
+    label = f"vhost {vh_name}:{port}"
+    print(f"  [>] Recursive enum: {label}")
+    try:
+        import requests as _rq
+        r = _rq.get(ip_url + "/", timeout=8, verify=False,
+                    headers={"Host": vh_name, "User-Agent": "StrikeARC"})
+        _tm = re.search(r"<title>(.*?)</title>", r.text or "", re.I)
+        title = _tm.group(1).strip() if _tm else ""
+        new_findings.append(
+            f"[ENUM] {label}: '{title[:60]}' status={r.status_code} size={len(r.text or '')}b"
+        )
+        page_html = r.text or ""
+    except Exception as e:
+        new_findings.append(f"[ENUM] {label}: unreachable ({type(e).__name__}) — skipped")
+        return
+
+    wl = state.get("wordlist", "") or "/usr/share/wordlists/dirb/common.txt"
+
+    # Directory bust against the IP with Host override
+    dirs = web.directory_bust(ip_url, wordlist=wl, host_header=vh_name)
+    interesting = [d for d in dirs if d["status"] == 200 and d["size"] > 50]
+    if interesting:
+        new_findings.append(f"[ENUM] {label}: {len(interesting)} accessible paths")
+        for d in interesting[:10]:
+            new_findings.append(f"  → {d['path']} ({d['status']}, {d['size']}b)")
+
+    # Config files (via IP + Host header)
+    try:
+        cfgs = web.check_config_files(ip_url, host_header=vh_name)
+        for cf in cfgs:
+            sev = cf["severity"].upper()
+            new_findings.append(
+                f"[{'!' if sev in ('HIGH', 'CRITICAL') else '*'}] {vh_name}{cf['path']} "
+                f"-> {cf['status']} ({cf['size']}b) [{sev}]"
+            )
+    except TypeError:
+        pass  # older signature without host_header
+    except Exception as e:
+        swallow(__name__ + ":vh_cfg", e)
+
+    # Recurse into found directories (one level, cap 5 subdirs per vhost)
+    if depth < 1 and interesting:
+        dir_paths = [d["path"] for d in interesting
+                     if "." not in d["path"].rsplit("/", 1)[-1]][:5]
+        for dp in dir_paths:
+            sub_url = f"{ip_url}{dp}" + ("" if dp.endswith("/") else "/")
+            sub_dirs = web.directory_bust(sub_url, wordlist=wl, host_header=vh_name)
+            for d in sub_dirs:
+                if d["status"] == 200 and d["size"] > 50 and d["path"] != dp:
+                    new_findings.append(
+                        f"[ENUM] {label}: recursive → {d['path']} ({d['status']}, {d['size']}b)"
+                    )
+
+    # Record the vhost as a web_app so it reaches the report
+    try:
+        from state import WebAppInfo
+        host.setdefault("web_apps", []).append(WebAppInfo(
+            url=f"{scheme}://{vh_name}:{port}/",
+            status_code=r.status_code,
+            title=title[:80],
+            server=r.headers.get("Server", ""),
+            technologies=[],
+            directories=[],
+            forms=[],
+            api_endpoints=[],
+            interesting_findings=[d["path"] for d in interesting[:10]],
+            enumerated=True,
+        ))
+    except Exception as e:
+        swallow(__name__ + ":vh_wa", e)
+
+
+def _get_evidence_store(state):
+    """Session-scoped EvidenceStore under /mnt/storage/strikearc/<session>/."""
+    key = "_evidence_store"
+    if key not in state:
+        from tools.evidence import EvidenceStore
+        session = state.get("session_id") or __import__("time").strftime("%Y%m%d_%H%M%S")
+        state[key] = EvidenceStore(session, enabled=True)
+        state["evidence_dir"] = state[key].root
+    return state[key]
 
 
 _DB_ERROR_PATTERNS = [
@@ -689,8 +917,17 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
     # Directory bust
     print(f"  [>] Directory busting {url}...")
     dirs = web.directory_bust(url, wordlist=state.get("wordlist", ""))
+    # v10: recurse one level into found directories — /admin/config/ not just
+    # /admin/ (recursive_directory_bust existed but was never called)
+    _wl = state.get("wordlist", "") or "/usr/share/wordlists/dirb/common.txt"
+    try:
+        deep_dirs = web.recursive_directory_bust(
+            url, wordlist=_wl, max_depth=2, found_dirs=list(dirs), _depth=1,
+        ) if dirs else dirs
+    except TypeError:
+        deep_dirs = dirs
     interesting_dirs = [
-        d for d in dirs if d["status"] == 200 and d["size"] > 50
+        d for d in (deep_dirs or dirs) if d["status"] == 200 and d["size"] > 50
     ]
     if interesting_dirs:
         new_findings.append(
@@ -897,6 +1134,18 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
                                 state.setdefault("_discovered_domains", set()).add(
                                     f"{r['name']}.{mail_domain}".lstrip(".")
                                 )
+                # v10: subdomain brute on email-derived domain + scope promotion
+                if _HAS_DNS and 53 in host.get("services", {}):
+                    import tools.dns_enum as dns_mod
+                    subs = dns_mod.subdomain_bruteforce(target, mail_domain)
+                    if subs:
+                        new_findings.append(
+                            f"[INTEL] {url}: {len(subs)} subdomains of {mail_domain} "
+                            f"(first: {', '.join(subs[:5])})"
+                        )
+                        for sub in subs[:5]:
+                            state.setdefault("_discovered_domains", set()).add(sub)
+                        _promote_dns_targets(state, target, subs, new_findings)
     if page_data.get("comments"):
         for c in page_data["comments"][:3]:
             new_findings.append(f"[ENUM] {url}: HTML comment: {c[:80]}")
@@ -983,8 +1232,26 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
         global_domains = state.get("_discovered_domains", set())
         vhost_domains.extend(global_domains - set(vhost_domains))
         vhosts = web.vhost_bruteforce(target, extra_domains=vhost_domains[:10])
+        # v10: persist on the host so the evidence hook can screenshot them
+        host["vhosts"] = vhosts
         for vh in vhosts:
             new_findings.append(f"[ENUM] {target}: Vhost discovered: {vh}")
+
+    # v10.2 RECURSIVE vhost enumeration: each named vhost gets its own
+    # fingerprint + directory bust (Host-header override) + config check +
+    # one-level subdirectory recursion. Budget-capped so a 9-vhost shared IP
+    # can't turn into an hour of gobuster. Gated by vhost_enum_done so the
+    # second web port doesn't re-run the whole vhost sweep.
+    if host.get("vhosts") and not host.get("vhost_enum_done"):
+        budget = state.get("vhost_enum_budget", 6)
+        for port, svc in host["services"].items():
+            if not _is_web_service((svc.get("service") or "").lower(), port):
+                continue
+            scheme = "https" if ("ssl" in (svc.get("service") or "").lower() or int(port) in (443, 8443)) else "http"
+            for vh in host["vhosts"][:budget]:
+                _enumerate_vhost(state, host, target, int(port), scheme, vh, new_findings)
+            break  # one web port per pass — deepest (first) wins
+        host["vhost_enum_done"] = True
 
     # CMS-specific enumeration
     tech_str = " ".join(tech.get("technologies", [])).lower() if tech else ""
@@ -1170,6 +1437,18 @@ def _enumerate_dns(state, host, target, new_findings):
             new_findings.append(f"[ENUM] {target}: {len(srv_records)} SRV records")
             for sr in srv_records[:5]:
                 new_findings.append(f"  → {sr}")
+        # v10: subdomain brute on the AD/domain_info name (deduped in-module
+        # against the cert/mail-domain paths) + promote new IPs into scope
+        import tools.dns_enum as dns_mod
+        subs = dns_mod.subdomain_bruteforce(target, di["name"])
+        if subs:
+            new_findings.append(
+                f"[INTEL] {target}: {len(subs)} subdomains of {di['name']} "
+                f"(first: {', '.join(subs[:5])})"
+            )
+            for sub in subs[:5]:
+                state.setdefault("_discovered_domains", set()).add(sub)
+            _promote_dns_targets(state, target, subs, new_findings)
 
 
 def _enumerate_snmp(state, host, target, new_findings):
@@ -1561,7 +1840,7 @@ def _run_cred_test(state: ReconState) -> List[str]:
                 for port, svc in services.items():
                     svc_name = svc.get("service", "").lower()
                     # Test HTTP Basic on web services
-                    if "http" in svc_name or "ssl" in svc_name or port in (80, 443, 8080, 8443):
+                    if _is_web_service(svc_name, port):
                         scheme = "https" if ("ssl" in svc_name or "https" in svc_name or port == 443) else "http"
                         url = f"{scheme}://{ip}:{port}"
                         try:
@@ -1611,7 +1890,7 @@ def _run_cred_test(state: ReconState) -> List[str]:
             continue
         for port, svc in host.get("services", {}).items():
             svc_name = svc.get("service", "").lower()
-            if "http" in svc_name or "ssl" in svc_name or port in (80, 443):
+            if _is_web_service(svc_name, port):
                 scheme = "https" if ("ssl" in svc_name or "https" in svc_name or port == 443) else "http"
                 url = f"{scheme}://{src_ip}:{port}"
                 print(f"  [>] Authenticated scan on {url} with {username}:{password}...")
@@ -2001,6 +2280,15 @@ def scope_node(state: ReconState) -> ReconState:
         state["stall_count"] = 0
     state["last_findings_len"] = findings_len
 
+    # v10.2: a "stall" is only real if no RECURSIVE work remains — hosts with
+    # discovered vhosts not yet deep-enumerated keep the loop alive so their
+    # subdomains/directories actually get fuzzed instead of the agent exiting.
+    if state.get("stall_count", 0) >= 1 and _recursive_work_pending(state):
+        print(f"\n  → ACTION: Recursive enumeration pending "
+              f"(vhosts/promoted hosts) — overriding stall")
+        state["stall_count"] = 0
+        # fall through: pick that work up below via the normal priority chain
+
     if state.get("stall_count", 0) >= 1:
         # Priority 4.5: Lab-death detection (run-15 gap: lab expired ~2h in;
         # the agent ground through ~40 more iterations / 159 connection-failed
@@ -2084,7 +2372,7 @@ def _select_best_target(state: ReconState, candidates: dict) -> str:
         score = 0
         for port, svc in host["services"].items():
             svc_name = svc["service"].lower()
-            if "http" in svc_name or "ssl" in svc_name:
+            if _is_web_service(svc_name, port):
                 score += 15
             if "smb" in svc_name or "microsoft-ds" in svc_name:
                 score += 10
@@ -2262,6 +2550,20 @@ actionable exploit suggestions."""
         f.write(report)
     print(f"\n  [+] Report saved to: {report_path}")
 
+    # ── Lead dashboard: coverage matrix + manual leads + evidence index ─────
+    try:
+        from knowledge.coverage import (build_coverage, coverage_stats,
+                                        manual_leads)
+        cov = state.get("coverage") or build_coverage(state)
+        if cov:
+            dash = _render_lead_dashboard(state, cov)
+            if dash:
+                with open(report_path, "a") as f:
+                    f.write("\n\n" + dash)
+                print(f"  [+] Lead dashboard appended ({len(dash)} chars)")
+    except Exception as exc:
+        print(f"  [COV] lead dashboard failed (non-fatal): {exc}")
+
     # Print top 5 attack vectors
     print(f"\n  [+] Top Attack Vectors ({len(all_vectors)} total):")
     for i, v in enumerate(all_vectors[:5]):
@@ -2272,6 +2574,82 @@ actionable exploit suggestions."""
 
     save_state(state)
     return {**state, "current_phase": "complete"}
+
+
+def _render_lead_dashboard(state: ReconState, cov: list) -> str:
+    """Manual-guidance dashboard: coverage matrix, ranked leads with the exact
+    commands from vault notes, and the evidence index."""
+    from knowledge.coverage import coverage_stats, display_commands, manual_leads
+
+    stats = coverage_stats(cov)
+    vault = os.path.expanduser("~")
+    lines = []
+    lines.append("---\n")
+    lines.append("## 9. Manual Lead Dashboard (Vault Coverage)")
+    lines.append(
+        f"\nEvery host×service below is mapped to your HTB-Academy vault techniques "
+        f"({stats['enum_safe']} enum-safe, {stats['manual_leads']} manual leads). "
+        f"Enum-safe items were candidates for automation; manual leads are yours to run.\n")
+    lines.append(f"| Metric | Value |")
+    lines.append(f"|---|---|")
+    lines.append(f"| Techniques applicable | {stats['total']} |")
+    lines.append(f"| Enum-safe automated | {stats['done']} done, {stats['skipped']} skipped |")
+    lines.append(f"| Pending enum-safe | {stats['pending_enum']} |")
+    lines.append(f"| **Manual leads** | **{stats['manual_leads']}** |\n")
+
+    # Coverage matrix — host × service with done/pending counts
+    lines.append("### Coverage Matrix")
+    lines.append("\n| Host | Service | Enum-safe (done/total) | Manual leads |")
+    lines.append("|---|---|---|---|")
+    agg = {}
+    for item in cov:
+        key = (item["host"], item["service"])
+        d = agg.setdefault(key, {"safe_done": 0, "safe_total": 0, "manual": 0})
+        if item["classification"] == "enum-safe":
+            d["safe_total"] += 1
+            if item["status"] == "done":
+                d["safe_done"] += 1
+        else:
+            d["manual"] += 1
+    for (host, svc), d in sorted(agg.items(), key=lambda x: -x[1]["manual"]):
+        lines.append(f"| {host} | {svc} | {d['safe_done']}/{d['safe_total']} | {d['manual']} |")
+
+    # Top manual leads with commands
+    lines.append("\n### Top Manual Leads (ranked)")
+    leads = manual_leads(cov, limit=25)
+    for n, lead in enumerate(leads, 1):
+        note = os.path.join(vault, "Documents/Purple-Teaming", lead["note_path"])
+        lines.append(f"\n**{n}. {lead['title'].replace('.md','')}** — `{lead['host']}:{lead['port']}` ({lead['service']}, match {lead['match']:.2f})")
+        lines.append(f"- Module: {lead['module']} · Note: `{note}`")
+        if lead.get("reason"):
+            lines.append(f"- Lead reason: {lead['reason']}")
+        cmds = display_commands(lead)
+        if cmds:
+            lines.append("- Commands from your notes:")
+            lines.append("  ```bash")
+            for c in cmds[:6]:
+                text = c.get("text", "").strip()
+                if text:
+                    lines.append(f"  # {note.rsplit('/',1)[-1]} :: {c.get('lang','bash')}")
+                    lines.append("  " + text.replace("\n", "\n  "))
+            lines.append("  ```")
+
+    # Evidence index
+    lines.append("\n### Evidence Index")
+    ev_dir = state.get("evidence_dir")
+    if not ev_dir:
+        lines.append("\n_No web evidence captured this session (no web hosts enumerated)._")
+    else:
+        lines.append(f"\nAll screenshots, headers, HTML bodies, and the aquatone gallery live under:\n`{ev_dir}`")
+        pages = state.get("evidence_web", [])
+        if pages:
+            lines.append("\n| URL | Title | Status | Screenshot |")
+            lines.append("|---|---|---|---|")
+            for p in pages:
+                shot = f"`{p['screenshot']}`" if p.get("screenshot") else "—"
+                title = (p.get("title") or "?").replace("|", "\\|")[:40]
+                lines.append(f"| {p['url']} | {title} | {p.get('status','?')} | {shot} |")
+    return "\n".join(lines)
 
 
 def _generate_heuristic_report(state: ReconState, summary: str,

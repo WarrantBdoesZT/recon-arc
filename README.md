@@ -7,6 +7,9 @@ An LLM-powered enumeration agent for HackTheBox Academy labs and CTF environment
 ## Features
 
 - 🌐 **Full-spectrum enumeration**: Network discovery, port scanning, service fingerprinting, web app analysis, AD enumeration
+- 🔁 **Recursive enumeration (v10.2)**: Subdomain brute (SecLists 2.3k words) → DNS-promoted new targets auto-scanned; discovered vhosts each get their own fingerprint + Host-header directory bust + config check + one-level subdirectory recursion; stall-exit overridden while recursive work remains
+- 📸 **Evidence capture**: Aquatone batch screenshots + tech fingerprints → `/mnt/storage/strikearc/<session>/`; vhosts shot via Chrome `--host-resolver-rules`; SHA-256 manifest
+- 🗂 **Vault coverage engine**: Every host×service mapped to your HTB-Academy notes — enum-safe checklist + ranked manual leads with exact commands (report §9)
 - 🎯 **Attack vector ranking**: Heuristic + LLM-powered scoring of every discovered attack path
 - 💡 **Exploit suggestions**: Specific commands and tools for each identified vector
 - 🔒 **Exploit-free recon mode**: `enum_agent.py` never executes exploits — pure reconnaissance

@@ -11,7 +11,7 @@ import json
 import os
 import operator
 from datetime import datetime
-from typing import Annotated, Dict, List, Optional, TypedDict
+from typing import Annotated, Dict, List, NotRequired, Optional, TypedDict
 
 
 def _strip_ansi(text: str) -> str:
@@ -331,6 +331,14 @@ class ReconState(TypedDict):
     # Vault knowledge matches (knowledge/retrieval.py) — notes injected at analyze time
     knowledge_matches: List[dict]
 
+    # Coverage engine (knowledge/coverage.py) — vault-technique checklist per
+    # host×service; rebuilt after enumeration updates; drives enum batches
+    coverage: List[dict]
+    # Evidence store root for this session (/mnt/storage/strikearc/<session>)
+    evidence_dir: NotRequired[str]
+    # Aquatone/web evidence collected this session (summary dicts)
+    evidence_web: NotRequired[List[dict]]
+
     # Iteration control
     iteration: int
     max_iterations: int
@@ -426,6 +434,7 @@ def initial_state(
         findings=[],
         errors=[],
         knowledge_matches=[],
+        coverage=[],
         iteration=0,
         max_iterations=max_iterations,
         stall_count=0,
@@ -505,7 +514,9 @@ def load_state(path: str) -> ReconState:
 def get_unenumerated_hosts(state: ReconState) -> Dict[str, NetworkHost]:
     return {
         ip: h for ip, h in state["hosts"].items()
-        if not h["enumerated"] and h["services"]
+        # v10.2: DNS-promoted hosts are born with services={} — include them
+        # (h["services"]) so the walker port-scans and enumerates them.
+        if not h["enumerated"] and (h["services"] or h.get("discovered_via", "").startswith("DNS:"))
     }
 
 
@@ -537,7 +548,7 @@ def get_engagement_summary(state: ReconState) -> str:
         )[:80]
         web_count = len(host.get("web_apps", []))
         av_count = len(host.get("attack_vectors", []))
-        lines.append(f"  {ip:16s} [{host['os']:8s}] {services}")
+        lines.append(f"  {ip:16s} [{host.get('os', '?'):8s}] {services}")
         if web_count:
             lines.append(f"                   Web apps: {web_count}")
         if av_count:

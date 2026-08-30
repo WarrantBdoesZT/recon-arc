@@ -353,6 +353,34 @@ def reverse_dns_sweep(subnet: str) -> List[dict]:
 # 4. Subdomain brute-force
 # ---------------------------------------------------------------------------
 
+# v10: real subdomain wordlists — SecLists if installed, builtin fallback
+_SECLISTS_DNS_DIRS = [
+    "/usr/share/seclists/Discovery/DNS/fierce-hostlist.txt",     # 2280
+    "/usr/share/seclists/Discovery/DNS/deepmagic.com-prefixes-top500.txt",  # 500
+]
+
+
+def _load_subdomain_wordlist() -> List[str]:
+    """Union of SecLists DNS wordlists + builtin. Deduped, order-preserving."""
+    seen = set()
+    words: List[str] = []
+    for path in _SECLISTS_DNS_DIRS:
+        try:
+            with open(path) as f:
+                for line in f:
+                    w = line.strip().lower()
+                    if w and w not in seen:
+                        seen.add(w)
+                        words.append(w)
+        except FileNotFoundError:
+            continue
+    for w in DEFAULT_SUBDOMAIN_WORDLIST:
+        if w not in seen:
+            seen.add(w)
+            words.append(w)
+    return words
+
+
 def subdomain_bruteforce(
     target_ip: str,
     domain: str,
@@ -374,11 +402,19 @@ def subdomain_bruteforce(
     failure.
     """
     if wordlist is None or len(wordlist) == 0:
-        wordlist = DEFAULT_SUBDOMAIN_WORDLIST
+        wordlist = _load_subdomain_wordlist()
 
     if not target_ip or not domain:
         print("    [+] DNS: subdomain_bruteforce — target_ip and domain are required")
         return []
+
+    # v10: session-level dedup — three call sites (cert-domain, mail-domain,
+    # DNS-service) can request the same domain; brute each (ip, domain) once
+    _key = f"subdone:{target_ip}:{domain.lower()}"
+    if _key in globals().get("_SUBDOMAIN_BRUTED", set()):
+        print(f"    [+] DNS: subdomain brute already done for {domain} via {target_ip} — skipping")
+        return []
+    globals().setdefault("_SUBDOMAIN_BRUTED", set()).add(_key)
 
     print(f"    [+] DNS: brute-forcing {len(wordlist)} subdomains for {domain} via {target_ip}")
 
@@ -410,20 +446,25 @@ def subdomain_bruteforce(
         return None
 
     # Parallel subdomain resolution with thread pool
+    # v10: SecLists wordlist is ~2.8k entries — need more workers + longer
+    # window (old 15/60s truncated the run and silently dropped candidates)
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    est = max(60, min(300, len(wordlist) // 20))
+    pool = ThreadPoolExecutor(max_workers=30)
     try:
-        with ThreadPoolExecutor(max_workers=15) as pool:
-            futures = {pool.submit(_try_subdomain, w): w for w in wordlist}
-            for future in as_completed(futures, timeout=60):
-                try:
-                    result = future.result(timeout=5)
-                    if result:
-                        discovered.append(result)
-                        print(f"    [+] DNS: FOUND {result}")
-                except Exception as e:
-                    swallow(__name__ + ":423", e)
+        futures = {pool.submit(_try_subdomain, w): w for w in wordlist}
+        for future in as_completed(futures, timeout=est):
+            try:
+                result = future.result(timeout=5)
+                if result:
+                    discovered.append(result)
+                    print(f"    [+] DNS: FOUND {result}")
+            except Exception as e:
+                swallow(__name__ + ":423", e)
     except Exception:
-        pass  # Timeout — we have what we have
+        pass  # Timeout — cancel the rest instead of grinding through them
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     print(f"    [+] DNS: subdomain brute-force complete — {len(discovered)} found")
     return sorted(set(discovered))
@@ -432,6 +473,43 @@ def subdomain_bruteforce(
 # ---------------------------------------------------------------------------
 # 5. DNS recursion check (open resolver)
 # ---------------------------------------------------------------------------
+
+
+def resolve_and_promote(
+    discovered: List[str],
+    dns_server: str,
+    known_ips: Optional[set] = None,
+) -> List[dict]:
+    """v10: turn 'sub.domain -> 10.x.x.x' brute results into new scan targets.
+
+    Parses the 'fqdn -> ip' strings from subdomain_bruteforce, keeps only IPs
+    NOT already in scope, and returns [{'ip':..., 'via': 'sub.domain'}] entries
+    ready for state['hosts'] promotion.
+    """
+    import ipaddress
+    known = known_ips or set()
+    out = []
+    seen = set()
+    for entry in discovered or []:
+        if "->" not in entry:
+            continue
+        fqdn, _, ip = entry.rpartition("->")
+        fqdn = fqdn.strip()
+        ip = ip.strip()
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        # v10.1: lab DNS often answers loopback (vhosts on the box itself).
+        # Promote ONLY private-range IPs — never loopback/link-local/multicast,
+        # never public (out-of-scope) addresses.
+        if not addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_multicast:
+            continue
+        if ip in known or ip in seen:
+            continue
+        seen.add(ip)
+        out.append({"ip": ip, "via": fqdn})
+    return out
 
 def check_dns_recursion(target_ip: str) -> bool:
     """
