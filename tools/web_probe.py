@@ -433,8 +433,9 @@ def probe_cms_paths(s, app, out, stats):
     t = " ".join(app.tech).lower()
     checks: List[Tuple[str, str, str]] = []      # (path, finding, vault note)
     if "wordpress" in t:
-        checks += [("/wp-links-opml.php", "WordPress version (wp-links-opml)", "Common Applications/02-WordPress.md"),
-                   ("/xmlrpc.php", "xmlrpc interface exposed", "Common Applications/02-WordPress.md"),
+        # NB: wp-links-opml.php NOT in vault (verified) — standard WP enum
+        # path kept for value; vault cites only the WP notes that exist.
+        checks += [("/xmlrpc.php", "xmlrpc interface exposed", "Common Applications/02-WordPress.md"),
                    ("/wp-login.php", "wp-login exposed", "Common Applications/02-WordPress.md"),
                    ("/wp-content/uploads/", "uploads dir listing", "Common Applications/02-WordPress.md")]
     if "drupal" in t:
