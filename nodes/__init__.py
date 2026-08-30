@@ -605,7 +605,8 @@ def _coverage_and_evidence(state, host, target, new_findings):
 
 
 def _shoot_vhosts(state, host, target, ev, new_findings):
-    """Screenshot discovered vhosts via Chrome --host-resolver-rules mapping."""
+    """Screenshot discovered vhosts via Chrome --host-resolver-rules mapping.
+    v10.3: vhosts may be dicts {name, port, scheme} or legacy strings."""
     vhosts = host.get("vhosts") or []
     if not vhosts:
         return
@@ -614,8 +615,19 @@ def _shoot_vhosts(state, host, target, ev, new_findings):
         for p, s in (host.get("services") or {}).items()
         if _is_web_service((s.get("service") or "").lower(), p)
     ]
-    for vh in vhosts[:8]:
-        name = vh if isinstance(vh, str) else vh.get("name", "")
+    for vh in vhosts[:10]:
+        if isinstance(vh, dict):
+            name = vh.get("name", "")
+            # prefer the port/scheme the vhost was actually found on
+            vh_port = vh.get("port")
+            vh_scheme = vh.get("scheme", "http")
+            if vh_port:
+                shot = ev.screenshot_vhost(name, target, int(vh_port), scheme=vh_scheme)
+                if shot:
+                    new_findings.append(f"[ENUM] vhost 📷 {name}:{vh_port} → {shot}")
+                    continue
+        else:
+            name = vh
         if not name or "." not in name:
             continue
         for p, scheme in ports_by_scheme[:2]:
@@ -625,17 +637,20 @@ def _shoot_vhosts(state, host, target, ev, new_findings):
                 break
 
 
-def _enumerate_vhost(state, host, target, port, scheme, vh_name, new_findings, depth=0):
-    """v10.2 RECURSIVE enumeration of one named vhost on a shared IP.
+def _enumerate_vhost(state, host, target, port, scheme, vh, new_findings, depth=0):
+    """v10.2/v10.3 RECURSIVE enumeration of one named vhost on a shared IP.
 
     Everything goes over the IP URL with an explicit Host header (no local
-    DNS needed): fingerprint → forms → directory bust → config files → JS
-    analysis. Any interesting subdirectories found are recursed into ONE
-    more level (depth-capped at 1 to bound total work).
+    DNS needed): fingerprint → forms → directory bust → config files →
+    one-level subdirectory recursion. v10.3: accepts vh as dict (new
+    vhost_bruteforce return) or str (legacy state); web_apps deduped by URL.
     """
+    vh_name = vh["name"] if isinstance(vh, dict) else vh
     ip_url = f"{scheme}://{target}:{port}"
     label = f"vhost {vh_name}:{port}"
     print(f"  [>] Recursive enum: {label}")
+    r = None
+    title = ""
     try:
         import requests as _rq
         r = _rq.get(ip_url + "/", timeout=8, verify=False,
@@ -645,12 +660,34 @@ def _enumerate_vhost(state, host, target, port, scheme, vh_name, new_findings, d
         new_findings.append(
             f"[ENUM] {label}: '{title[:60]}' status={r.status_code} size={len(r.text or '')}b"
         )
-        page_html = r.text or ""
     except Exception as e:
         new_findings.append(f"[ENUM] {label}: unreachable ({type(e).__name__}) — skipped")
         return
 
     wl = state.get("wordlist", "") or "/usr/share/wordlists/dirb/common.txt"
+
+    # v10.3: real tech fingerprint + forms for THIS vhost (Host-header aware)
+    tech_tags = []
+    try:
+        ft = web.fingerprint_tech(ip_url, host_header=vh_name)
+        if ft:
+            tech_tags = ft.get("technologies", [])[:8]
+            if tech_tags:
+                new_findings.append(f"[ENUM] {label}: tech: {', '.join(tech_tags)}")
+            if ft.get("title") and not title:
+                title = ft["title"]
+    except Exception as e:
+        swallow(__name__ + ":vh_ft", e)
+    try:
+        vforms = web.discover_forms(ip_url, host_header=vh_name)
+        if vforms:
+            new_findings.append(f"[ENUM] {label}: {len(vforms)} form(s)")
+            for fm in vforms[:3]:
+                fields = fm.get("fields", [])
+                flds = ", ".join(fields) if isinstance(fields, list) else str(fields)
+                new_findings.append(f"  → {label} {fm.get('method','?')} {fm.get('action','?')} fields=[{flds}]")
+    except Exception as e:
+        swallow(__name__ + ":vh_forms", e)
 
     # Directory bust against the IP with Host override
     dirs = web.directory_bust(ip_url, wordlist=wl, host_header=vh_name)
@@ -658,7 +695,7 @@ def _enumerate_vhost(state, host, target, port, scheme, vh_name, new_findings, d
     if interesting:
         new_findings.append(f"[ENUM] {label}: {len(interesting)} accessible paths")
         for d in interesting[:10]:
-            new_findings.append(f"  → {d['path']} ({d['status']}, {d['size']}b)")
+            new_findings.append(f"  → {label} {d['path']} ({d['status']}, {d['size']}b)")
 
     # Config files (via IP + Host header)
     try:
@@ -687,21 +724,28 @@ def _enumerate_vhost(state, host, target, port, scheme, vh_name, new_findings, d
                         f"[ENUM] {label}: recursive → {d['path']} ({d['status']}, {d['size']}b)"
                     )
 
-    # Record the vhost as a web_app so it reaches the report
+    # Record the vhost as a web_app — v10.3: dedup by URL (each vhost once)
     try:
         from state import WebAppInfo
-        host.setdefault("web_apps", []).append(WebAppInfo(
-            url=f"{scheme}://{vh_name}:{port}/",
+        vh_url = f"{scheme}://{vh_name}:{port}/"
+        apps = host.setdefault("web_apps", [])
+        existing = next((a for a in apps if a.get("url") == vh_url), None)
+        wa = WebAppInfo(
+            url=vh_url,
             status_code=r.status_code,
             title=title[:80],
             server=r.headers.get("Server", ""),
-            technologies=[],
-            directories=[],
+            technologies=tech_tags,
+            directories=interesting[:25],
             forms=[],
             api_endpoints=[],
             interesting_findings=[d["path"] for d in interesting[:10]],
             enumerated=True,
-        ))
+        )
+        if existing:
+            apps[apps.index(existing)] = wa  # refresh in place
+        else:
+            apps.append(wa)
     except Exception as e:
         swallow(__name__ + ":vh_wa", e)
 
@@ -1225,17 +1269,23 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
 
     # Vhost brute-forcing (only on first web port)
     if port == 80 or port == 443:
-        print(f"  [>] Vhost brute-forcing {target}...")
+        print(f"  [>] Vhost brute-forcing {target}:{port}...")
         # Use cert-derived domains + globally discovered domains for targeted vhost brute
         vhost_domains = list(host.get("_cert_domains", []))
         # Also pull domains discovered from other hosts' SSL certs
         global_domains = state.get("_discovered_domains", set())
         vhost_domains.extend(global_domains - set(vhost_domains))
-        vhosts = web.vhost_bruteforce(target, extra_domains=vhost_domains[:10])
-        # v10: persist on the host so the evidence hook can screenshot them
+        _vh_scheme = "https" if ("ssl" in svc_name or port == 443) else "http"
+        vhosts = web.vhost_bruteforce(
+            target, extra_domains=vhost_domains[:10],
+            port=port, scheme=_vh_scheme,
+        )
+        # v10: persist on the host so the evidence hook can screenshot them.
+        # v10.3: vhost_bruteforce now returns dicts {name, port, scheme, title,...}
         host["vhosts"] = vhosts
         for vh in vhosts:
-            new_findings.append(f"[ENUM] {target}: Vhost discovered: {vh}")
+            _n = vh["name"] if isinstance(vh, dict) else vh
+            new_findings.append(f"[ENUM] {target}: Vhost discovered: {_n}")
 
     # v10.2 RECURSIVE vhost enumeration: each named vhost gets its own
     # fingerprint + directory bust (Host-header override) + config check +
@@ -1243,13 +1293,13 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
     # can't turn into an hour of gobuster. Gated by vhost_enum_done so the
     # second web port doesn't re-run the whole vhost sweep.
     if host.get("vhosts") and not host.get("vhost_enum_done"):
-        budget = state.get("vhost_enum_budget", 6)
-        for port, svc in host["services"].items():
-            if not _is_web_service((svc.get("service") or "").lower(), port):
+        budget = state.get("vhost_enum_budget", 10)
+        for vport, svc in host["services"].items():
+            if not _is_web_service((svc.get("service") or "").lower(), vport):
                 continue
-            scheme = "https" if ("ssl" in (svc.get("service") or "").lower() or int(port) in (443, 8443)) else "http"
+            vscheme = "https" if ("ssl" in (svc.get("service") or "").lower() or int(vport) in (443, 8443)) else "http"
             for vh in host["vhosts"][:budget]:
-                _enumerate_vhost(state, host, target, int(port), scheme, vh, new_findings)
+                _enumerate_vhost(state, host, target, int(vport), vscheme, vh, new_findings)
             break  # one web port per pass — deepest (first) wins
         host["vhost_enum_done"] = True
 

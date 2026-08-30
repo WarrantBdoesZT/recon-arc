@@ -101,9 +101,10 @@ def directory_bust(
     return dirs
 
 
-def discover_forms(url: str) -> List[dict]:
-    """Extract all HTML forms from a page."""
-    resp = http_get(url)
+def discover_forms(url: str, host_header: Optional[str] = None) -> List[dict]:
+    """Extract all HTML forms from a page.
+    v10.3: host_header — extract forms from a named vhost on a shared IP."""
+    resp = http_get(url, headers={"Host": host_header} if host_header else None)
     if not resp:
         return []
 
@@ -181,9 +182,10 @@ def api_enumerate(url: str) -> dict:
     return result
 
 
-def fingerprint_tech(url: str) -> dict:
-    """Detect web technologies, frameworks, and CMS."""
-    resp = http_get(url)
+def fingerprint_tech(url: str, host_header: Optional[str] = None) -> dict:
+    """Detect web technologies, frameworks, and CMS.
+    v10.3: host_header — fingerprint a named vhost on a shared IP."""
+    resp = http_get(url, headers={"Host": host_header} if host_header else None)
     if not resp:
         return {}
 
@@ -418,12 +420,16 @@ def vhost_bruteforce(
     wordlist: str = "/usr/share/wordlists/dirb/common.txt",
     max_time: int = 30,
     extra_domains: List[str] = None,
-) -> List[str]:
+    port: int = 80,
+    scheme: str = "http",
+) -> List[dict]:
     """Brute-force virtual hosts on the target IP.
 
-    Uses common vhost prefixes combined with any domains discovered from SSL
-    certs or DNS enumeration (``extra_domains``).  Runs in parallel with a
-    hard ``max_time`` cap to prevent hangs.
+    v10.3: returns dicts [{name, port, scheme, title, status, size}] instead
+    of bare name strings (back-compat: callers use vh if str else vh["name"]).
+    Detection now ALSO compares <title> vs baseline (a same-size vhost with a
+    different title was invisible to the old size-only check) and accepts any
+    status >= 200 that differs from baseline status (not just 200/301/302).
     """
     import time
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -516,27 +522,40 @@ def vhost_bruteforce(
 
     # Get baseline
     start_time = time.time()
-    baseline = http_get(f"http://{ip}", timeout=5, allow_redirects=False)
-    baseline_size = len(baseline.text) if baseline else 0
+    _base_headers = {"Host": ip}  # explicit IP Host = default site
+    baseline = http_get(f"{scheme}://{ip}:{port}", timeout=5,
+                        allow_redirects=False, headers=_base_headers)
+    baseline_size = len(baseline.text or "") if baseline else 0
     baseline_status = baseline.status_code if baseline else 0
+    _bt = re.search(r"<title>(.*?)</title>", (baseline.text or ""), re.I)
+    baseline_title = _bt.group(1).strip()[:60] if _bt else ""
 
     discovered = []
 
     def _check_vhost(domain):
-        """Check a single vhost. Returns (domain, status, size) or None."""
+        """Check a single vhost. Returns (domain, status, size, title) or None."""
         elapsed = time.time() - start_time
         if elapsed > max_time:
             return None
         resp = http_get(
-            f"http://{ip}", timeout=3, allow_redirects=False,
+            f"{scheme}://{ip}:{port}", timeout=3, allow_redirects=False,
             headers={"Host": domain},
         )
+        if not resp:
+            return None
+        size = len(resp.text or "")
+        tm = re.search(r"<title>(.*?)</title>", resp.text or "", re.I)
+        title = tm.group(1).strip()[:60] if tm else ""
         # v8.2.2: redirects (301/302) are also vhost evidence — GitLab's
         # sign-in redirect was invisible to a 200-only check.
-        if resp and resp.status_code in (200, 301, 302):
-            size = len(resp.text)
-            if abs(size - baseline_size) > 100:
-                return (domain, size)
+        # v10.3: title-diff OR status-diff OR size-diff — size-only missed
+        # same-size vhosts (and wildcard default sites hid small ones).
+        if resp.status_code in (200, 301, 302) or (
+            200 <= resp.status_code < 400 and resp.status_code != baseline_status
+        ):
+            if (abs(size - baseline_size) > 100
+                    or (title and title != baseline_title)):
+                return (domain, resp.status_code, size, title)
         return None
 
     # Parallel with hard timeout
@@ -547,9 +566,12 @@ def vhost_bruteforce(
                 try:
                     result = future.result(timeout=3)
                     if result:
-                        domain, size = result
-                        discovered.append(domain)
-                        print(f"    [+] Vhost: {domain} ({size}b)")
+                        domain, status, size, title = result
+                        discovered.append({
+                            "name": domain, "port": port, "scheme": scheme,
+                            "title": title, "status": status, "size": size,
+                        })
+                        print(f"    [+] Vhost: {domain} ({size}b{', ' + repr(title) if title else ''})")
                 except Exception as e:
                     swallow(__name__ + ":444", e)
     except Exception:

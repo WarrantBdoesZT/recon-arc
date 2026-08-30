@@ -102,8 +102,13 @@ def vhost_urls_from_state(state: Dict, ip: Optional[str]) -> List[str]:
     if ip and ip in hosts:
         for port in (80, 8080, 443):
             urls.append(f"http://{ip}:{port}/")
-    # vhosts discovered during enumeration live in findings like
-    # '[+] Vhost: status.inlanefreight.local'
+    # vhosts discovered during enumeration live on host['vhosts'] (dicts with
+    # 'name') and in findings like '[+] Vhost: status.inlanefreight.local'
+    if ip and ip in hosts:
+        for vh in (hosts[ip].get("vhosts") or []):
+            name = vh.get("name") if isinstance(vh, dict) else vh
+            if name:
+                urls.append(f"http://{ip or ''}/  {name}".strip())
     for f in _findings_texts(state):
         for m in re.finditer(r"Vhost:\s*([a-z0-9.-]+)", f, re.I):
             urls.append(f"http://{ip or ''}/  {m.group(1)}".strip())
