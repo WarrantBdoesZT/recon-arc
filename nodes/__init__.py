@@ -603,6 +603,10 @@ def _coverage_and_evidence(state, host, target, new_findings):
         # v10: vhost screenshots — aquatone can't send Host headers, so shoot
         # discovered vhosts individually with Chrome --host-resolver-rules
         _shoot_vhosts(state, host, target, ev, new_findings)
+        # v10.4.5: persist final merged vhost list → /etc/hosts so every
+        # named-URL consumer (probe battery, cred tests, recommended
+        # sqlmap/wpscan commands, operator copy-paste) resolves
+        _write_etc_hosts(state, host, target, new_findings)
     except Exception as exc:
         swallow(__name__ + ":_cov_ev", exc)
 
@@ -639,6 +643,107 @@ def _coverage_and_evidence(state, host, target, new_findings):
                   f"{ml} manual lead(s) from vault")
     except Exception as exc:
         swallow(__name__ + ":_probe", exc)
+
+
+def _write_etc_hosts(state, host, target, new_findings):
+    """v10.4.5: persist discovered vhosts to /etc/hosts in a managed block.
+
+    Per-vhost enum and screenshots don't need this (Host-header override /
+    Chrome --host-resolver-rules), but every consumer of the NAMED URLs
+    stored in web_apps/findings does: cred-testing, authenticated scans,
+    sqlmap/wpscan/nikto commands the report recommends, and the operator
+    copy-pasting URLs. Without /etc/hosts those names resolve nowhere.
+
+    Idempotent: one managed '# BEGIN/END StrikeARC vhosts' block; rewritten
+    only when the name→IP set changes; names the operator already mapped
+    to the same IP elsewhere in the file are left alone. Requires
+    passwordless sudo (sudo -n); on failure it degrades to a findings note
+    — never blocks the run.
+    """
+    import subprocess as _sp
+    import tempfile as _tf
+    import os as _os
+
+    BEGIN, END = "# BEGIN StrikeARC vhosts", "# END StrikeARC vhosts"
+    vhosts = host.get("vhosts") or []
+    # name→target map; only dotted names (real FQDNs) belong in hosts(5)
+    wanted = {}
+    for vh in vhosts:
+        name = vh["name"] if isinstance(vh, dict) else vh
+        name = str(name).strip().lower().split("->")[0].strip()
+        if name and "." in name:
+            wanted[name] = target
+    if not wanted:
+        return
+
+    try:
+        current = open("/etc/hosts").read()
+    except PermissionError:
+        current = None
+    if current is None:
+        # can't even read it (unlikely) — nothing we can do safely
+        return
+
+    lines = current.splitlines()
+    # Parse operator's own mappings: skip our managed block
+    outside = []
+    in_block = False
+    block_names = {}
+    for ln in lines:
+        if ln.strip() == BEGIN:
+            in_block = True
+            continue
+        if ln.strip() == END:
+            in_block = False
+            continue
+        if in_block:
+            parts = ln.split()
+            if len(parts) >= 2:
+                for nm in parts[1:]:
+                    block_names[nm.lower()] = parts[0]
+            continue
+        outside.append(ln)
+    # Operator already mapped a name to the same IP elsewhere? Keep theirs.
+    for ln in outside:
+        parts = ln.split()
+        if len(parts) >= 2 and parts[0] == target:
+            for nm in parts[1:]:
+                nm = nm.lower()
+                if nm in wanted:
+                    del wanted[nm]
+
+    # Names already correct inside our block? No rewrite needed.
+    if all(block_names.get(n) == ip for n, ip in wanted.items()) and not (
+            set(block_names) - set(wanted)):
+        return
+
+    entries = sorted(wanted.items())
+    block = [BEGIN] + [f"{ip} {nm}" for nm, ip in entries] + [END]
+    new_content = "\n".join(outside + block).rstrip("\n") + "\n"
+
+    try:
+        with _tf.NamedTemporaryFile("w", delete=False, dir="/tmp",
+                                    prefix="starc_hosts_") as tf:
+            tf.write(new_content)
+            tmp = tf.name
+        _os.chmod(tmp, 0o644)
+        # Passwordless sudo only — never prompt mid-run
+        proc = _sp.run(["sudo", "-n", "cp", tmp, "/etc/hosts"],
+                       capture_output=True, timeout=10)
+        _os.unlink(tmp)
+        if proc.returncode != 0:
+            new_findings.append(
+                f"[ENUM] {target}: {len(entries)} vhost(s) NOT added to /etc/hosts "
+                f"(sudo unavailable) — add manually for named-URL tooling"
+            )
+            return
+        new_findings.append(
+            f"[ENUM] {target}: {len(entries)} vhost(s) written to /etc/hosts "
+            f"(managed block): {', '.join(n for n, _ in entries[:8])}"
+            + (" …" if len(entries) > 8 else "")
+        )
+    except Exception as e:
+        swallow(__name__ + ":etc_hosts", e)
 
 
 def _shoot_vhosts(state, host, target, ev, new_findings):
