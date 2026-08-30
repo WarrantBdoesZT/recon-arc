@@ -717,6 +717,13 @@ def _write_etc_hosts(state, host, target, new_findings):
             set(block_names) - set(wanted)):
         return
 
+    # v10.4.5: multi-host engagements — keep OTHER hosts' entries from the
+    # old block (host B's write must not drop host A's mappings); only
+    # stale entries for THIS target's IP are replaced by `wanted`.
+    for n, ip in block_names.items():
+        if ip != target and n not in wanted:
+            wanted[n] = ip
+
     entries = sorted(wanted.items())
     block = [BEGIN] + [f"{ip} {nm}" for nm, ip in entries] + [END]
     new_content = "\n".join(outside + block).rstrip("\n") + "\n"
