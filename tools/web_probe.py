@@ -430,7 +430,9 @@ def probe_js_endpoints(s, app, out, stats):
 def probe_cms_paths(s, app, out, stats):
     """CMS/app-specific path probing (Common Applications/*): probe the
     canonical enum paths for whatever the fingerprint says."""
-    t = " ".join(app.tech).lower()
+    # v10.4.3: match on tech AND label — a vhost named support.inlanefreight
+    # has osTicket paths even when its fingerprint is just "PHP/Bootstrap"
+    t = (" ".join(app.tech) + " " + app.host_header + " " + app.label).lower()
     checks: List[Tuple[str, str, str]] = []      # (path, finding, vault note)
     if "wordpress" in t:
         # NB: wp-links-opml.php NOT in vault (verified) — standard WP enum

@@ -354,9 +354,14 @@ def reverse_dns_sweep(subnet: str) -> List[dict]:
 # ---------------------------------------------------------------------------
 
 # v10: real subdomain wordlists — SecLists if installed, builtin fallback
+# v10.4.3: much larger union — the old fierce+deep500 (2.8k) missed
+# tracking/gitlab until HTTP vhost-brute caught them. bitquark-100k is
+# quality-ranked; top1million-20k adds breadth without Jhaddix's 2.1M grind.
 _SECLISTS_DNS_DIRS = [
-    "/usr/share/seclists/Discovery/DNS/fierce-hostlist.txt",     # 2280
+    "/usr/share/seclists/Discovery/DNS/fierce-hostlist.txt",             # 2.2k
     "/usr/share/seclists/Discovery/DNS/deepmagic.com-prefixes-top500.txt",  # 500
+    "/usr/share/seclists/Discovery/DNS/bitquark-subdomains-top100000.txt",   # 100k
+    "/usr/share/seclists/Discovery/DNS/subdomains-top1million-20000.txt",    # 20k
 ]
 
 

@@ -235,7 +235,10 @@ def _recursive_work_pending(state) -> bool:
         if not isinstance(h, dict):
             continue
         # vhosts discovered but never deep-enumerated
-        if h.get("vhosts") and not h.get("vhost_enum_done"):
+        pending_vh = [vh for vh in (h.get("vhosts") or [])
+                      if not (isinstance(vh, dict) and vh.get("deep_enum"))
+                      and not (isinstance(vh, str) and h.get("vhost_enum_done"))]
+        if pending_vh:
             return True
         # DNS-promoted hosts never picked up (created with services={})
         if h.get("discovered_via", "").startswith("DNS:") and not h.get("services"):
@@ -682,6 +685,7 @@ def _enumerate_vhost(state, host, target, port, scheme, vh, new_findings, depth=
     vh_name = vh["name"] if isinstance(vh, dict) else vh
     ip_url = f"{scheme}://{target}:{port}"
     label = f"vhost {vh_name}:{port}"
+    vforms: List[dict] = []   # v10.4.3: collected by discover_forms below
     print(f"  [>] Recursive enum: {label}")
     r = None
     title = ""
@@ -696,6 +700,8 @@ def _enumerate_vhost(state, host, target, port, scheme, vh, new_findings, depth=
         )
     except Exception as e:
         new_findings.append(f"[ENUM] {label}: unreachable ({type(e).__name__}) — skipped")
+        if isinstance(vh, dict):
+            vh["deep_enum"] = True   # don't retry dead vhosts forever
         return
 
     wl = state.get("wordlist", "") or "/usr/share/wordlists/dirb/common.txt"
@@ -725,7 +731,10 @@ def _enumerate_vhost(state, host, target, port, scheme, vh, new_findings, depth=
 
     # Directory bust against the IP with Host override
     dirs = web.directory_bust(ip_url, wordlist=wl, host_header=vh_name)
-    interesting = [d for d in dirs if d["status"] == 200 and d["size"] > 50]
+    # v10.4.3: 301/401 are leads too (Drupal/WP redirect-storms were stored
+    # as 0 dirs); filter junk by size floor only
+    interesting = [d for d in dirs
+                   if d["status"] in (200, 301, 401) and d["size"] > 50]
     if interesting:
         new_findings.append(f"[ENUM] {label}: {len(interesting)} accessible paths")
         for d in interesting[:10]:
@@ -771,7 +780,7 @@ def _enumerate_vhost(state, host, target, port, scheme, vh, new_findings, depth=
             server=r.headers.get("Server", ""),
             technologies=tech_tags,
             directories=interesting[:25],
-            forms=[],
+            forms=vforms or [],   # v10.4.3: was discarded (forms=[]) — vpn's login form was lost
             api_endpoints=[],
             interesting_findings=[d["path"] for d in interesting[:10]],
             enumerated=True,
@@ -782,6 +791,9 @@ def _enumerate_vhost(state, host, target, port, scheme, vh, new_findings, depth=
             apps.append(wa)
     except Exception as e:
         swallow(__name__ + ":vh_wa", e)
+    finally:
+        if isinstance(vh, dict):
+            vh["deep_enum"] = True   # v10.4.3: per-vhost mark replaces blunt gate
 
 
 def _get_evidence_store(state):
@@ -1302,7 +1314,7 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
     host.setdefault("attack_vectors", []).extend(extra_vectors)
 
     # Vhost brute-forcing (only on first web port)
-    if port == 80 or port == 443:
+    if port in (80, 443, 8080, 8443, 8000):
         print(f"  [>] Vhost brute-forcing {target}:{port}...")
         # Use cert-derived domains + globally discovered domains for targeted vhost brute
         vhost_domains = list(host.get("_cert_domains", []))
@@ -1324,15 +1336,19 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
     # v10.2 RECURSIVE vhost enumeration: each named vhost gets its own
     # fingerprint + directory bust (Host-header override) + config check +
     # one-level subdirectory recursion. Budget-capped so a 9-vhost shared IP
-    # can't turn into an hour of gobuster. Gated by vhost_enum_done so the
-    # second web port doesn't re-run the whole vhost sweep.
-    if host.get("vhosts") and not host.get("vhost_enum_done"):
+    # can't turn into an hour of gobuster. v10.4.3: per-vhost deep_enum mark
+    # (new vhosts discovered on ANY port get their pass; old blunt
+    # vhost_enum_done skipped them).
+    pending = [vh for vh in host.get("vhosts", [])
+               if not (isinstance(vh, dict) and vh.get("deep_enum"))
+               and not (isinstance(vh, str) and host.get("vhost_enum_done"))]
+    if pending:
         budget = state.get("vhost_enum_budget", 10)
         for vport, svc in host["services"].items():
             if not _is_web_service((svc.get("service") or "").lower(), vport):
                 continue
             vscheme = "https" if ("ssl" in (svc.get("service") or "").lower() or int(vport) in (443, 8443)) else "http"
-            for vh in host["vhosts"][:budget]:
+            for vh in pending[:budget]:
                 _enumerate_vhost(state, host, target, int(vport), vscheme, vh, new_findings)
             break  # one web port per pass — deepest (first) wins
         host["vhost_enum_done"] = True

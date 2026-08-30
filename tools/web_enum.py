@@ -77,7 +77,11 @@ def directory_bust(
 
     dirs = []
     if result["stdout"]:
+        _ansi = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
         for line in result["stdout"].strip().split("\n"):
+            # v10.4.3: strip gobuster progress ANSI (␛[2K) — it was leaking
+            # into stored paths ('\x1b[2K/.html'), doubling every entry
+            line = _ansi.sub("", line)
             # gobuster output: /path (Status: 200) [Size: 1234]
             m = re.match(r"^(.+?)\s+\(Status:\s*(\d+)\)\s*\[Size:\s*(\d+)\]", line.strip())
             if m:
@@ -91,6 +95,15 @@ def directory_bust(
                         if abs(size - baseline_size) <= max(64, baseline_size * 0.05):
                             continue  # identical to soft-404 — skip
                 dirs.append({"path": path, "status": status, "size": size})
+
+    # v10.4.3: 403-storm filter — a deny-all/WAF default returns 403 for
+    # EVERYTHING (run: ir vhost = 74×403). If 403s dominate, they're noise;
+    # keep them only when they're a minority signal (real auth-wall).
+    n403 = sum(1 for d in dirs if d["status"] == 403)
+    if dirs and n403 > len(dirs) * 0.6:
+        sizes_403 = {d["size"] for d in dirs if d["status"] == 403}
+        if len(sizes_403) <= 3:  # uniform 403 page = WAF default
+            dirs = [d for d in dirs if d["status"] != 403]
 
     # hard cap: never store more than 500 paths per web app (state-size
     # hygiene — 98k-entry lists once crashed analysis context)
@@ -417,8 +430,8 @@ def extract_data_from_page(url: str) -> dict:
 
 def vhost_bruteforce(
     ip: str,
-    wordlist: str = "/usr/share/wordlists/dirb/common.txt",
-    max_time: int = 30,
+    wordlist: str = "/usr/share/seclists/Discovery/DNS/bitquark-subdomains-top100000.txt",
+    max_time: int = 150,
     extra_domains: List[str] = None,
     port: int = 80,
     scheme: str = "http",
@@ -430,6 +443,9 @@ def vhost_bruteforce(
     Detection now ALSO compares <title> vs baseline (a same-size vhost with a
     different title was invisible to the old size-only check) and accepts any
     status >= 200 that differs from baseline status (not just 200/301/302).
+    v10.4.3: default wordlist is now a real DNS list (bitquark-100k,
+    frequency-ranked), candidate cap 200→3000, max_time 30→150 — the old
+    dirb/common.txt ×6-suffix ×200-cap combo missed real vhosts.
     """
     import time
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -452,7 +468,7 @@ def vhost_bruteforce(
     try:
         with open(wordlist) as f:
             for i, line in enumerate(f):
-                if i > 5000:
+                if i > 3000:     # v10.4.3: was 500-word cap — too shallow
                     break
                 word = line.strip()
                 if word:
@@ -516,18 +532,24 @@ def vhost_bruteforce(
                 if d not in seen:
                     seen.add(d)
                     candidates.append(d)
-        candidates = candidates[:200]
+        candidates = candidates[:3000]   # v10.4.3: was 200 — junk evicted real names
     else:
-        candidates = sorted(domains)[:200]
+        candidates = sorted(domains)[:3000]
 
     # Get baseline
     start_time = time.time()
     _base_headers = {"Host": ip}  # explicit IP Host = default site
     baseline = http_get(f"{scheme}://{ip}:{port}", timeout=5,
                         allow_redirects=False, headers=_base_headers)
+    if baseline is None:
+        # v10.4.3: transient saturation (our own burst can DoS a lab box for
+        # a moment) — one retry after a beat before declaring the port dead
+        time.sleep(6)
+        baseline = http_get(f"{scheme}://{ip}:{port}", timeout=8,
+                            allow_redirects=False, headers=_base_headers)
     baseline_size = len(baseline.text or "") if baseline else 0
     baseline_status = baseline.status_code if baseline else 0
-    _bt = re.search(r"<title>(.*?)</title>", (baseline.text or ""), re.I)
+    _bt = re.search(r"<title>(.*?)</title>", (baseline.text if baseline else "") or "", re.I)
     baseline_title = _bt.group(1).strip()[:60] if _bt else ""
 
     discovered = []
