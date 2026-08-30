@@ -601,7 +601,41 @@ def _coverage_and_evidence(state, host, target, new_findings):
         # discovered vhosts individually with Chrome --host-resolver-rules
         _shoot_vhosts(state, host, target, ev, new_findings)
     except Exception as exc:
-        print(f"  [EV] evidence sweep failed (non-fatal): {exc}")
+        swallow(__name__ + ":_cov_ev", exc)
+
+    # v10.4: vault-driven web probing battery on every web app + vhost
+    try:
+        from tools.web_probe import probe_web_app, surfaces_from_host
+        surfaces = surfaces_from_host(host, target)
+        if surfaces:
+            print(f"  [PROBE] web-app battery: {len(surfaces)} surface(s) "
+                  f"(vault-driven, enum-safe)")
+            state["web_probe_results"] = state.get("web_probe_results", [])
+            state["web_probe_leads"] = state.get("web_probe_leads", [])
+            for surf in surfaces:
+                results, leads = probe_web_app(surf)
+                sev_rank = {"high": 0, "med": 1, "low": 2}
+                results.sort(key=lambda r: sev_rank.get(r.sev, 3))
+                for r in results:
+                    state["web_probe_results"].append({
+                        "tech": r.tech, "target": r.target, "finding": r.finding,
+                        "evidence": r.evidence, "sev": r.sev, "vault": r.vault})
+                    if r.sev in ("high", "med"):
+                        marker = "[!]" if r.sev == "high" else "[*]"
+                        new_findings.append(
+                            f"{marker} {r.target}: {r.finding}"
+                            + (f" ({r.evidence[:60]})" if r.evidence else ""))
+                state["web_probe_leads"].extend(
+                    [{"tech": l.tech, "target": l.target, "command": l.command,
+                      "why": l.why, "sev": l.sev, "vault": l.vault}
+                     for l in leads])
+            hi = sum(1 for r in state["web_probe_results"] if r["sev"] == "high")
+            med = sum(1 for r in state["web_probe_results"] if r["sev"] == "med")
+            ml = len(state["web_probe_leads"])
+            print(f"  [PROBE] done: {hi} high / {med} med findings, "
+                  f"{ml} manual lead(s) from vault")
+    except Exception as exc:
+        swallow(__name__ + ":_probe", exc)
 
 
 def _shoot_vhosts(state, host, target, ev, new_findings):
@@ -2541,6 +2575,32 @@ def report_node(state: ReconState) -> ReconState:
             all_vectors.append(v)
             seen_ids.add(vid)
 
+    # v10.4: high-severity web probe findings become attack vectors
+    seen_ids_probe = set()
+    for r in (state.get("web_probe_results") or []):
+        if r["sev"] != "high":
+            continue
+        vid = f"probe_{r['tech']}_{r['target']}".replace(" ", "_").replace(":", "_")
+        if vid in seen_ids_probe:
+            continue
+        seen_ids_probe.add(vid)
+        matching = [l for l in (state.get("web_probe_leads") or [])
+                    if l["tech"].startswith(r["tech"].split("-")[0])
+                    and l["target"] == r["target"]]
+        cmds = [m["command"].splitlines()[0] for m in matching[:2] if m.get("command")]
+        all_vectors.append(AttackVector(
+            id=vid, target=r["target"], category="initial_access",
+            vector_type=r["tech"],
+            title=f"[probe] {r['finding'][:80]}",
+            description=(r.get("evidence") or "")[:160] or "vault-driven probe hit",
+            confidence="high",
+            score=70 + (5 if cmds else 0),
+            evidence=[r.get("finding", "")] + ([r.get("evidence", "")] if r.get("evidence") else []),
+            exploit_suggestions=cmds or [f"vault: {r.get('vault','')}"],
+            prerequisites=[], cves=[],
+            references=[r.get("vault", "")],
+        ))
+
     # Sort by score
     all_vectors = sorted(all_vectors, key=lambda v: v.get("score", 0), reverse=True)
 
@@ -2677,11 +2737,41 @@ def _render_lead_dashboard(state: ReconState, cov: list) -> str:
         if cmds:
             lines.append("- Commands from your notes:")
             lines.append("  ```bash")
-            for c in cmds[:6]:
-                text = c.get("text", "").strip()
-                if text:
-                    lines.append(f"  # {note.rsplit('/',1)[-1]} :: {c.get('lang','bash')}")
-                    lines.append("  " + text.replace("\n", "\n  "))
+            for c in cmds[:4]:
+                if isinstance(c, dict):
+                    text = c.get("text", "").strip()
+                    if text:
+                        lines.append(f"  # {lead['note_path'].rsplit('/',1)[-1]} :: {c.get('lang','bash')}")
+                        lines.append("  " + text.replace("\n", "\n  "))
+                else:
+                    lines.append(f"  {c}")
+            lines.append("  ```")
+
+    # v10.4: web-app probe battery findings + vault manual leads
+    pr = state.get("web_probe_results") or []
+    if pr:
+        hi = [r for r in pr if r["sev"] == "high"]
+        med = [r for r in pr if r["sev"] == "med"]
+        lines.append(f"\n### Web App Probe Battery ({len(pr)} findings)")
+        lines.append(f"\n_Enum-safe vault-driven probes across {len({r['target'] for r in pr})} "
+                     f"web surface(s): {len(hi)} high, {len(med)} medium._")
+        for r in (hi + med)[:20]:
+            lines.append(f"- {'**HIGH**' if r['sev']=='high' else 'med'} `{r['target']}` — {r['finding']}"
+                         + (f" _({r['evidence'][:50]})_" if r.get("evidence") else ""))
+            if r.get("vault"):
+                lines.append(f"  - vault: `{r['vault']}`")
+    wl = state.get("web_probe_leads") or []
+    if wl:
+        lines.append(f"\n### Web App Manual Leads (vault commands)")
+        sev_rank = {"high": 0, "med": 1, "low": 2}
+        wl_sorted = sorted(wl, key=lambda l: sev_rank.get(l["sev"], 3))
+        for n, l in enumerate(wl_sorted[:25], 1):
+            lines.append(f"\n**{n}. {l['tech']}** — `{l['target']}` ({l['sev']})")
+            lines.append(f"- why: {l['why']} · vault: `{l['vault']}`")
+            lines.append("- command:")
+            lines.append("  ```bash")
+            for ln in l["command"].splitlines():
+                lines.append(f"  {ln}")
             lines.append("  ```")
 
     # Evidence index

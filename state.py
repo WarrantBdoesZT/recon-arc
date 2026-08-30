@@ -338,6 +338,8 @@ class ReconState(TypedDict):
     evidence_dir: NotRequired[str]
     # Aquatone/web evidence collected this session (summary dicts)
     evidence_web: NotRequired[List[dict]]
+    web_probe_results: NotRequired[List[dict]]
+    web_probe_leads: NotRequired[List[dict]]
 
     # Iteration control
     iteration: int
