@@ -1328,7 +1328,22 @@ def _enumerate_web(state, host, target, port, svc, new_findings):
         )
         # v10: persist on the host so the evidence hook can screenshot them.
         # v10.3: vhost_bruteforce now returns dicts {name, port, scheme, title,...}
-        host["vhosts"] = vhosts
+        # v10.4.3: MERGE by name — a second web port (e.g. 8080) finding no
+        # vhosts must not wipe the list (and deep_enum marks) from port 80.
+        prior = {vh["name"]: vh for vh in host.get("vhosts", [])
+                 if isinstance(vh, dict)}
+        merged = []
+        for vh in vhosts:
+            name = vh["name"] if isinstance(vh, dict) else vh
+            old = prior.pop(name, None)
+            if isinstance(vh, dict) and isinstance(old, dict):
+                old.update({k: v for k, v in vh.items() if v})
+                merged.append(old)          # keep old deep_enum mark
+            else:
+                merged.append(vh)
+        merged.extend(prior.values())        # keep vhosts this port didn't see
+        host["vhosts"] = merged
+        vhosts = merged
         for vh in vhosts:
             _n = vh["name"] if isinstance(vh, dict) else vh
             new_findings.append(f"[ENUM] {target}: Vhost discovered: {_n}")
