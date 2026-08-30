@@ -211,6 +211,14 @@ def search_cves(service: str, version: str) -> List[Dict]:
                 description = desc.get("value", "")
                 break
 
+        # v10.4.3c: relevance gate — NVD keywordSearch matches LOOSELY
+        # ("openssh 8.2" matches any CVE whose text contains "8.2", e.g. the
+        # Baxter infusion-pump CVE-2020-12062). Require the service name
+        # itself to appear in the description, else the CVE is noise.
+        svc_word = (service or "").lower().strip()
+        if svc_word and svc_word not in description.lower():
+            continue
+
         # CVSS v3 metrics (prefer v3.1, then v3.0)
         metrics = cve_obj.get("metrics", {})
         cvss_data = metrics.get("cvssMetricV31") or metrics.get("cvssMetricV30") or []

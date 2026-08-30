@@ -372,7 +372,20 @@ Examples:
             print(f"\n[INIT] Targeting {len(args.targets)} specific host(s)")
             for ip in args.targets:
                 print(f"  [>] Quick scan {ip}...")
+                # v10.4.3c: fresh HTB instances have a slow-boot window where
+                # the first quick-scan returns zero ports (caused two full
+                # empty engagements on 10.129.146.243). Retry up to 3x with
+                # backoff before giving up on the host.
                 services, os_hint, _ = recon.quick_scan(ip)
+                _qs_attempts = 1
+                while not services and _qs_attempts < 3:
+                    import time as _t
+                    _delay = 15 * _qs_attempts
+                    print(f"  [!] {ip}: no services detected "
+                          f"(attempt {_qs_attempts}/3) — retrying in {_delay}s")
+                    _t.sleep(_delay)
+                    services, os_hint, _ = recon.quick_scan(ip)
+                    _qs_attempts += 1
                 if services:
                     host = NetworkHost(
                         ip=ip, hostname=None, os=os_hint, os_version="",
